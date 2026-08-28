@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    container_name: tg-auto-poster
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - bot_data:/app/data
+
+volumes:
+  bot_data:
