@@ -8,7 +8,7 @@ import logging
 
 import channel_parser as cp
 import database as db
-from ai.analyzer import analyze_post, is_reklama
+from ai.analyzer import analyze_post
 from config import FETCH_POST_DELAY, IMPORTANCE_MIN, MONITOR_INTERVAL_SEC, MONITOR_LOOKBACK
 from session_manager import get_client
 
@@ -70,41 +70,47 @@ def _fresh_stats() -> dict:
 
 
 async def _process_post(stats: dict, m, ch: dict, source_ref: str) -> None:
-    """Анализирует один пост донора. Если он важен и не реклама — сохраняет в память."""
+    """Берёт пост (текст и/или медиа) и сохраняет смысл в память.
+
+    Фильтров рекламы/мусора нет: любой пост идёт в память, чтобы AI
+    мог на нём генерировать контент. Медиа качается всегда, если есть.
+    """
     text = (m.text or "").strip()
+    media_path = ""
+    if getattr(m, "media", None):
+        media_path = await cp.download_media(m) or ""
+
     if not text:
-        return  # чистый медиа-пост без текста — переписывать нечего
-
-    # Быстрая дешёвая проверка: AI отвечает одним числом 0/1.
-    # Если явная реклама — скипаем сразу, без полного анализа (быстрее и дешевле).
-    if await is_reklama(text):
-        stats["skipped"] += 1
-        return
-
-    analysis = await analyze_post(text, "")
-    if analysis.get("is_ad"):
-        stats["skipped"] += 1
-        return
-
-    if analysis.get("importance", 1) >= IMPORTANCE_MIN:
-        media_path = ""
-        if getattr(m, "media", None):
-            media_path = await cp.download_media(m) or ""
+        # Медиа-пост без текста — сохраняем как идею по картинке.
         await db.save_to_memory(
             channel_id=ch["channel_id"],
             source_channel_id=source_ref,
-            topic=analysis.get("topic", ""),
-            summary=analysis.get("summary", ""),
-            keywords=analysis.get("keywords", ""),
-            importance=analysis.get("importance", 5),
-            emotion=analysis.get("emotion", "neutral"),
-            raw_text=text[:3000],
+            topic="Медиа-идея",
+            summary="Медиа-пост без текста (готовая идея по картинке/видео)",
+            keywords="",
+            importance=5,
+            emotion="neutral",
+            raw_text="",
             source_post_id=m.id,
             media_path=media_path,
         )
         stats["saved"] += 1
-    elif analysis.get("importance", 1) == 0:
-        stats["analyzed_fail"] += 1
+        return
+
+    analysis = await analyze_post(text, "")
+    await db.save_to_memory(
+        channel_id=ch["channel_id"],
+        source_channel_id=source_ref,
+        topic=analysis.get("topic", "") or "Идея",
+        summary=analysis.get("summary", "") or text[:200],
+        keywords=analysis.get("keywords", ""),
+        importance=analysis.get("importance", 5),
+        emotion=analysis.get("emotion", "neutral"),
+        raw_text=text[:3000],
+        source_post_id=m.id,
+        media_path=media_path,
+    )
+    stats["saved"] += 1
 
 
 async def analyze_channel(ch: dict, sources: list[dict], state: dict,

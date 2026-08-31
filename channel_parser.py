@@ -199,7 +199,7 @@ async def iter_new_posts(identifier: str, after_id: int, limit: int = 10):
         async for m in client.iter_messages(entity, limit=limit):
             if m.id <= after_id:
                 return
-            if m.text:
+            if m.text or m.media:
                 yield m
     except Exception as e:  # noqa: BLE001
         logger.warning("Ошибка чтения %s: %s", identifier, e)
@@ -220,7 +220,7 @@ async def iter_recent_posts(identifier: str, limit: int = 20):
         if entity is None:
             return
         async for m in client.iter_messages(entity, limit=limit):
-            if m.text:
+            if m.text or m.media:
                 yield m
     except Exception as e:  # noqa: BLE001
         logger.warning("Ошибка чтения истории %s: %s", identifier, e)
