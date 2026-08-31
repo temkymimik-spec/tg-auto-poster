@@ -10,6 +10,8 @@
 import asyncio
 import logging
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import channel_parser as cp
 import database as db
@@ -19,6 +21,7 @@ from config import (
     COPY_DELAY,
     POSTS_PER_DAY,
     POST_HOURS,
+    SCHEDULE_TZ,
 )
 from session_manager import get_client
 
@@ -30,6 +33,15 @@ _run_flag = asyncio.Event()
 # ключи в таблице settings
 _CURSOR_KEY = "schedule_cursor"
 _LAST_KEY = "schedule_last"
+
+try:
+    _TZ = ZoneInfo(SCHEDULE_TZ)
+except Exception:  # noqa: BLE001
+    _TZ = ZoneInfo("Europe/Moscow")
+
+
+def _now_msk() -> datetime:
+    return datetime.now(_TZ)
 
 
 def is_running() -> bool:
@@ -68,7 +80,7 @@ async def _loop() -> None:
 
 
 def _today() -> str:
-    return time.strftime("%Y-%m-%d")
+    return _now_msk().strftime("%Y-%m-%d")
 
 
 async def cycle() -> None:
@@ -111,7 +123,7 @@ async def _run_schedule() -> None:
     if not channels:
         return
 
-    hour = time.localtime().tm_hour
+    hour = _now_msk().hour
     slots = sorted(POST_HOURS)
     if hour not in slots:
         return
@@ -153,7 +165,9 @@ async def auto_post_for(ch: dict) -> bool:
     if memory:
         result = await generate_from_memory(memory, ch.get("style_prompt", ""))
         if result.get("text"):
-            ok = await _publish(ch_id, result["text"], provider=result["provider"], model=result["model"])
+            media = memory[0].get("media_path") or ""
+            ok = await _publish(ch_id, result["text"], media=media,
+                                provider=result["provider"], model=result["model"])
             await asyncio.sleep(COPY_DELAY)
             return ok
 
