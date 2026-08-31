@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 
 def _default_result() -> dict:
     return {"topic": "", "summary": "", "keywords": "",
-            "importance": 1, "emotion": "neutral", "is_ad": 0}
+            "importance": 1, "emotion": "neutral", "is_ad": 0, "post_type": "content"}
 
 
 async def analyze_post(post_text: str, channel_context: str = "") -> dict:
-    """Анализирует один пост -> {topic, summary, keywords, importance, emotion, is_ad}."""
+    """Анализирует один пост -> {topic, summary, keywords, importance, emotion, is_ad, post_type}."""
     if not post_text or not post_text.strip():
         return _default_result()
 
@@ -38,6 +38,9 @@ async def analyze_post(post_text: str, channel_context: str = "") -> dict:
         is_ad = 1 if str(data.get("is_ad", "0")).strip() in ("1", "true", "True", "yes") else 0
         if is_ad:
             importance = 1
+        post_type = str(data.get("post_type", "content")).strip().lower()
+        if post_type not in ("content", "prompt", "news", "instruction", "promo"):
+            post_type = "content"
         return {
             "topic": str(data.get("topic", ""))[:120],
             "summary": str(data.get("summary", ""))[:500],
@@ -45,6 +48,7 @@ async def analyze_post(post_text: str, channel_context: str = "") -> dict:
             "importance": importance,
             "emotion": emotion,
             "is_ad": is_ad,
+            "post_type": post_type,
         }
     except providers.AIError as e:
         logger.warning("Не удалось проанализировать пост: %s", e)
