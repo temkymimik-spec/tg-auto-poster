@@ -90,7 +90,7 @@ async def auto_post_for(ch: dict) -> bool:
         return ok
 
     # 2) генерируем из памяти
-    memory = await db.get_recent_memory(ch_id, hours=48, min_importance=5, limit=8)
+    memory = await db.get_recent_memory(ch_id, hours=48, min_importance=3, limit=10)
     if memory:
         from ai.analyzer import generate_from_memory
         result = await generate_from_memory(memory, ch.get("style_prompt", ""))

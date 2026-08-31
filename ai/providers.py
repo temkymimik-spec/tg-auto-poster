@@ -15,6 +15,7 @@ import aiohttp
 
 import database as db
 from config import (
+    AI_CONNECT_TIMEOUT,
     AI_MAX_FAILS,
     AI_TIMEOUT,
     KEY_POOL_TTL,
@@ -52,7 +53,9 @@ class RotationEngine:
     # ------------------------------------------------------------ lifecycle
     async def start(self) -> None:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=AI_TIMEOUT))
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=AI_TIMEOUT, connect=AI_CONNECT_TIMEOUT)
+            )
         await self.refresh()
 
     async def stop(self) -> None:

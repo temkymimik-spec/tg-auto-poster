@@ -234,7 +234,7 @@ async def channel_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         await query.edit_message_text("Канал не найден.")
         await query.answer()
         return
-    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=5, limit=8)
+    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=3, limit=10)
     result = None
     if memory:
         result = await generate_from_memory(memory, ch.get("style_prompt", ""))
@@ -461,7 +461,7 @@ async def mem_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, chann
     query = update.callback_query
     ch = await db.get_channel(channel_id)
     await query.edit_message_text("🔄 Генерирую из памяти…")
-    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=5, limit=8)
+    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=3, limit=10)
     result = await generate_from_memory(memory, (ch.get("style_prompt") if ch else ""))
     if result.get("text"):
         post_id = await db.save_post(channel_id, result["text"],
@@ -816,7 +816,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "memory_gen_topic" and extra:
         await update.message.reply_text("🔄 Генерирую…")
         ch = await db.get_channel(extra)
-        memory = await db.get_recent_memory(extra, hours=48, min_importance=5, limit=8)
+        memory = await db.get_recent_memory(extra, hours=48, min_importance=3, limit=10)
         result = await generate_from_memory(memory, (ch.get("style_prompt") if ch else ""), target_topic=text)
         if result.get("text"):
             post_id = await db.save_post(extra, result["text"],

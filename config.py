@@ -132,18 +132,19 @@ AI_MAX_FAILS = _int("AI_MAX_FAILS", 5)
 
 # ------------------------------------------------------- мониторинг и постинг
 MONITOR_INTERVAL_SEC = _int("MONITOR_INTERVAL_SEC", 60)
-MONITOR_LOOKBACK = _int("MONITOR_LOOKBACK", 15)       # сколько последних постов перечитывать за цикл
-IMPORTANCE_MIN = _int("IMPORTANCE_MIN", 5)            # порог важности для сохранения в память
+MONITOR_LOOKBACK = _int("MONITOR_LOOKBACK", 25)       # сколько последних постов перечитывать за цикл
+IMPORTANCE_MIN = _int("IMPORTANCE_MIN", 4)            # порог важности для сохранения в память
 POST_INTERVAL_DEFAULT = _int("POST_INTERVAL_DEFAULT", 60)  # минут
 AUTOPOST_LOOP_SEC = _int("AUTOPOST_LOOP_SEC", 60)
-FETCH_POST_DELAY = _float("FETCH_POST_DELAY", 1.0)    # пауза между постами при анализе
-COPY_DELAY = _float("COPY_DELAY", 2.0)
+FETCH_POST_DELAY = _float("FETCH_POST_DELAY", 0.3)    # пауза между постами при анализе
+COPY_DELAY = _float("COPY_DELAY", 1.0)
 
 MAX_TEXT_LEN = _int("MAX_TEXT_LEN", 4096)
 MAX_CAPTION_LEN = _int("MAX_CAPTION_LEN", 1024)
 MAX_INPUT_POST_LEN = _int("MAX_INPUT_POST_LEN", 3000)
 
-AI_TIMEOUT = _int("AI_TIMEOUT", 90)                   # HTTP timeout для AI
+AI_TIMEOUT = _int("AI_TIMEOUT", 40)                   # HTTP timeout для AI (запрос)
+AI_CONNECT_TIMEOUT = _int("AI_CONNECT_TIMEOUT", 10)   # timeout на соединение (анти-зависание)
 KEY_POOL_TTL = _int("KEY_POOL_TTL", 60)               # перечитывать ключи каждые N сек
 
 # ---------------------------------------------------------------- логирование

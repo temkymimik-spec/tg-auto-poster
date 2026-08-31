@@ -9,6 +9,9 @@ logger = logging.getLogger(__name__)
 
 TIME_BETWEEN_SENDS = 1.5
 
+# кэш сущностей, чтобы не дёргать сервер Telethon на каждый вызов
+_entity_cache: dict[str, object] = {}
+
 
 def normalize_ref(raw: str) -> str:
     """Приводит ссылку/username/id к виду, который Telethon поймёт."""
@@ -22,6 +25,17 @@ def normalize_ref(raw: str) -> str:
     return ref.split("?")[0]
 
 
+async def _get_entity(client, identifier: str):
+    """Возвращает сущность канала, используя кэш по нормализованной ссылке."""
+    key = normalize_ref(identifier)
+    cached = _entity_cache.get(key)
+    if cached is not None:
+        return cached
+    entity = await client.get_entity(key)
+    _entity_cache[key] = entity
+    return entity
+
+
 async def resolve_channel(identifier: str) -> dict | None:
     """Резолвит канал в {id, title, username}. Требует подключённый аккаунт."""
     client = await get_client()
@@ -30,6 +44,7 @@ async def resolve_channel(identifier: str) -> dict | None:
     try:
         entity = await client.get_entity(normalize_ref(identifier))
         if isinstance(entity, Channel):
+            _entity_cache[normalize_ref(identifier)] = entity
             return {
                 "id": str(entity.id),
                 "title": entity.title,
@@ -47,14 +62,15 @@ async def fetch_recent_posts(identifier: str, limit: int = 5) -> list[dict]:
     if client is None:
         return []
     try:
-        entity = await client.get_entity(normalize_ref(identifier))
+        entity = await _get_entity(client, identifier)
         posts = []
         async for m in client.iter_messages(entity, limit=limit):
-            if not m.text:
+            text = (m.text or "").strip()
+            if not text:
                 continue
             posts.append({
                 "id": m.id,
-                "text": m.text,
+                "text": text,
                 "date": m.date.isoformat() if m.date else "",
                 "has_media": bool(m.media),
             })
@@ -70,11 +86,11 @@ async def iter_new_posts(identifier: str, after_id: int, limit: int = 10):
     if client is None:
         return
     try:
-        entity = await client.get_entity(normalize_ref(identifier))
+        entity = await _get_entity(client, identifier)
         async for m in client.iter_messages(entity, limit=limit):
             if m.id <= after_id:
                 return
-            if m.text:
+            if m.text and m.text.strip():
                 yield m
     except Exception as e:  # noqa: BLE001
         logger.warning("Ошибка чтения %s: %s", identifier, e)

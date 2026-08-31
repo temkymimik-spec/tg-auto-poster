@@ -14,9 +14,10 @@ from ai.prompts import (
 logger = logging.getLogger(__name__)
 
 
-def _default_result() -> dict:
+def _default_result(analyze_failed: bool = False) -> dict:
     return {"topic": "", "summary": "", "keywords": "",
-            "importance": 1, "emotion": "neutral"}
+            "importance": 0 if analyze_failed else 1, "emotion": "neutral",
+            "analyze_failed": analyze_failed}
 
 
 async def analyze_post(post_text: str, channel_context: str = "") -> dict:
@@ -41,13 +42,14 @@ async def analyze_post(post_text: str, channel_context: str = "") -> dict:
             "keywords": str(data.get("keywords", ""))[:300],
             "importance": importance,
             "emotion": emotion,
+            "analyze_failed": False,
         }
     except providers.AIError as e:
         logger.warning("Не удалось проанализировать пост: %s", e)
-        return _default_result()
+        return _default_result(analyze_failed=True)
     except Exception as e:  # noqa: BLE001
         logger.exception("Ошибка анализа поста: %s", e)
-        return _default_result()
+        return _default_result(analyze_failed=True)
 
 
 async def generate_from_text(source_text: str, style_prompt: str = "",
