@@ -6,12 +6,30 @@ from ai.prompts import (
     ANALYZE_SYSTEM,
     COPYWRITER_SYSTEM,
     MEMORY_WRITER_SYSTEM,
+    QUERY_SYSTEM,
     analyze_prompt,
     copywrite_prompt,
     memory_prompt,
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def make_search_queries(channel_theme: str) -> list[str]:
+    """Генерирует 1-2 поисковых запроса по описанию темы канала."""
+    theme = (channel_theme or "").strip()
+    if not theme:
+        return []
+    user = f"Тематика канала:\n{theme}\n\nПридумай поисковые запросы."
+    try:
+        data = await providers.parse_json_ai(QUERY_SYSTEM, user, temperature=0.4, max_tokens=300)
+        queries = data.get("queries") or []
+        if not isinstance(queries, list):
+            return []
+        out = [str(q).strip() for q in queries if str(q).strip()]
+        return out[:3]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _default_result() -> dict:

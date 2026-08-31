@@ -1,16 +1,15 @@
-"""Мониторинг каналов-конкурентов: читает новые посты и складывает в память.
+"""Мониторинг: собирает контент из интернета по темам каналов и сохраняет в память.
 
-Плюс разовый «бэкфилл» — наполнение памяти историей постов донора
-(кнопка в боте), чтобы не ждать, пока появятся новые посты.
+Работает через AI-генерацию поисковых запросов → DuckDuckGo → извлечение
+контента → анализ → сохранение в memory.
 """
 import asyncio
 import logging
 
-import channel_parser as cp
 import database as db
-from ai.analyzer import analyze_post
-from config import FETCH_POST_DELAY, IMPORTANCE_MIN, MONITOR_INTERVAL_SEC, MONITOR_LOOKBACK
-from session_manager import get_client
+import web_fetch as wf
+from ai.analyzer import analyze_post, make_search_queries
+from config import IMPORTANCE_MIN, MONITOR_INTERVAL_SEC, WEB_MAX_ITEMS, WEB_MAX_QUERIES
 
 logger = logging.getLogger(__name__)
 
@@ -54,132 +53,85 @@ async def _loop() -> None:
 
 
 async def cycle() -> None:
-    if await get_client() is None:
-        return  # аккаунт не подключён — мониторить нечем
+    """Периодический цикл: для каждого активного канала с описанием — сбор из интернета."""
     channels = await db.get_channels(active_only=True)
     for ch in channels:
-        sources = await db.get_source_channels(ch["channel_id"])
-        if not sources:
+        desc = (ch.get("channel_description") or "").strip()
+        if not desc:
             continue
-        state = await db.get_monitor_state(ch["channel_id"])
-        await analyze_channel(ch, sources, state)
-
-
-def _fresh_stats() -> dict:
-    return {"new_posts": 0, "saved": 0, "analyzed_fail": 0, "skipped": 0, "errors": 0}
-
-
-async def _process_post(stats: dict, m, ch: dict, source_ref: str) -> None:
-    """Берёт пост (текст и/или медиа) и сохраняет смысл в память.
-
-    Фильтров рекламы/мусора нет: любой пост идёт в память, чтобы AI
-    мог на нём генерировать контент. Медиа качается всегда, если есть.
-    Один неудачный пост не должен ломать остальные — ошибки считаем в stats["errors"].
-    """
-    text = (m.text or "").strip()
-    media_path = ""
-    if getattr(m, "media", None):
+        state = await db.get_web_collect_state(ch["channel_id"])
+        interval = max(int(ch.get("post_interval_min") or 60), 1) * 60
+        now = asyncio.get_event_loop().time()
+        if now - float(state.get("last_collect_time") or 0) < interval:
+            continue
         try:
-            media_path = await cp.download_media(m) or ""
+            await collect_for_channel(ch)
+            await db.update_web_collect_state(ch["channel_id"])
         except Exception as e:  # noqa: BLE001
-            logger.warning("Не удалось скачать медиа поста %s: %s", m.id, e)
-            media_path = ""
-
-    try:
-        if not text:
-            # Медиа-пост без текста — сохраняем как идею по картинке.
-            await db.save_to_memory(
-                channel_id=ch["channel_id"],
-                source_channel_id=source_ref,
-                topic="Медиа-идея",
-                summary="Медиа-пост без текста (готовая идея по картинке/видео)",
-                keywords="",
-                importance=5,
-                emotion="neutral",
-                raw_text="",
-                source_post_id=m.id,
-                media_path=media_path,
-            )
-        else:
-            analysis = await analyze_post(text, "")
-            await db.save_to_memory(
-                channel_id=ch["channel_id"],
-                source_channel_id=source_ref,
-                topic=analysis.get("topic", "") or "Идея",
-                summary=analysis.get("summary", "") or text[:200],
-                keywords=analysis.get("keywords", ""),
-                importance=analysis.get("importance", 5),
-                emotion=analysis.get("emotion", "neutral"),
-                raw_text=text[:3000],
-                source_post_id=m.id,
-                media_path=media_path,
-            )
-        stats["saved"] += 1
-    except Exception as e:  # noqa: BLE001
-        logger.exception("Не удалось сохранить пост %s (%s): %s", m.id, source_ref, e)
-        stats["errors"] += 1
+            logger.warning("Мониторинг канала %s: %s", ch["channel_id"], e)
 
 
-async def analyze_channel(ch: dict, sources: list[dict], state: dict,
-                          lookback: int | None = None) -> dict:
-    """Анализирует новые посты по источникам канала. Возвращает статистику прогона."""
-    lookback = lookback or MONITOR_LOOKBACK
-    client = await get_client()
-    if client is None:
-        return {"error": "аккаунт не подключён"}
+async def collect_for_channel(ch: dict) -> dict:
+    """Собирает контент для канала из интернета по его описанию."""
+    desc = (ch.get("channel_description") or "").strip()
+    stats = {"queries": 0, "saved": 0, "errors": 0}
+    if not desc:
+        return stats
 
-    stats = _fresh_stats()
-    last_id = state.get("last_post_id", 0)
-    new_last = last_id
+    queries = await make_search_queries(desc)
+    stats["queries"] = len(queries)
 
-    for source in sources:
-        source_ref = source["source_channel_id"]
+    for q in queries[:WEB_MAX_QUERIES]:
         try:
-            async for m in cp.iter_new_posts(source_ref, after_id=last_id, limit=lookback):
-                if m.id <= last_id:
-                    continue
-                stats["new_posts"] += 1
-                new_last = max(new_last, m.id)
+            results = await wf.search_ddg(q, max_results=WEB_MAX_ITEMS)
+            for r in results:
                 try:
-                    await _process_post(stats, m, ch, source_ref)
-                finally:
-                    await asyncio.sleep(FETCH_POST_DELAY)
+                    await _save_result(ch, r)
+                    stats["saved"] += 1
+                    await asyncio.sleep(1.5)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Ошибка сохранения результата: %s", e)
+                    stats["errors"] += 1
         except Exception as e:  # noqa: BLE001
-            logger.warning("Ошибка мониторинга источника %s: %s", source_ref, e)
-
-    if new_last > last_id:
-        await db.update_monitor_state(ch["channel_id"], new_last)
+            logger.warning("Ошибка поиска '%s': %s", q, e)
 
     logger.info("Мониторинг %s: %s", ch.get("channel_title", ch["channel_id"]), stats)
     return stats
 
 
-async def backfill_memory(ch: dict, sources: list[dict], limit: int = 20) -> dict:
-    """Разовый прогон истории постов донора в память.
+async def _save_result(ch: dict, result: dict) -> None:
+    """Извлекает контент со страницы и сохраняет в память."""
+    url = result.get("url", "")
+    title = result.get("title", "")
+    snippet = result.get("snippet", "")
 
-    Читает ПОСЛЕДНИЕ `limit` постов каждого источника (в прошлое) и анализирует.
-    НЕ трогает last_post_id — чтобы свежие новые посты потом тоже ловились.
-    Возвращает статистику: {posts_checked, saved, analyzed_fail, skipped, errors}.
-    """
-    client = await get_client()
-    if client is None:
-        return {"error": "аккаунт не подключён"}
+    text = f"{title}\n{snippet}".strip()
+    if not text or len(text) < 20:
+        return
 
-    stats = _fresh_stats()
-    stats["posts_checked"] = 0
+    media_path = ""
+    media_url = ""
+    page = await wf.extract_article(url)
+    if page.get("image_url"):
+        media_url = page["image_url"]
+        media_path = await wf.download_image(page["image_url"])
 
-    for source in sources:
-        source_ref = source["source_channel_id"]
-        try:
-            async for m in cp.iter_recent_posts(source_ref, limit=limit):
-                stats["posts_checked"] += 1
-                try:
-                    await _process_post(stats, m, ch, source_ref)
-                finally:
-                    await asyncio.sleep(FETCH_POST_DELAY)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Ошибка бэкфилла источника %s: %s", source_ref, e)
-            stats["skipped"] += 1
+    analysis = await analyze_post(text[:3000], ch.get("channel_description", ""))
 
-    logger.info("Бэкфилл %s: %s", ch.get("channel_title", ch["channel_id"]), stats)
-    return stats
+    await db.save_to_memory(
+        channel_id=ch["channel_id"],
+        source_url=url,
+        topic=analysis.get("topic", "") or title[:120],
+        summary=analysis.get("summary", "") or text[:500],
+        keywords=analysis.get("keywords", ""),
+        importance=analysis.get("importance", 5),
+        emotion=analysis.get("emotion", "neutral"),
+        raw_text=text[:3000],
+        media_path=media_path,
+        media_url=media_url,
+    )
+
+
+async def manual_collect(ch: dict) -> dict:
+    """Ручной запуск сбора контента для канала."""
+    return await collect_for_channel(ch)

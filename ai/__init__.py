@@ -10,7 +10,7 @@ from ai.providers import (
 from ai.analyzer import (
     analyze_post,
     generate_from_memory,
-    generate_from_text,
+    make_search_queries,
 )
 
 __all__ = [
@@ -22,5 +22,5 @@ __all__ = [
     "providers_shutdown",
     "analyze_post",
     "generate_from_memory",
-    "generate_from_text",
+    "make_search_queries",
 ]

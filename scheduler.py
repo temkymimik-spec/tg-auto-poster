@@ -1,11 +1,8 @@
-"""Автопостинг: публикация отложенных постов/рекламы и авто-расписание.
+"""Автопостинг: публикация постов и авто-расписание.
 
 Два режима:
-1) Точное расписание: POSTS_PER_DAY раз в день в заданные часы (POST_HOURS)
-   публикуется один сгенерированный пост. Канал выбирается по кругу (round-robin)
-   среди активных каналов.
-2) Интервальный (fallback, когда POSTS_PER_DAY=0): каждый канал публикует
-   по своему интервалу post_interval_min.
+1) Точное расписание: POSTS_PER_DAY раз в день в заданные часы (POST_HOURS).
+2) Интервальный (fallback, когда POSTS_PER_DAY=0).
 """
 import asyncio
 import logging
@@ -15,22 +12,14 @@ from zoneinfo import ZoneInfo
 
 import channel_parser as cp
 import database as db
-from ai.analyzer import generate_from_memory, generate_from_text
-from config import (
-    AUTOPOST_LOOP_SEC,
-    COPY_DELAY,
-    POSTS_PER_DAY,
-    POST_HOURS,
-    SCHEDULE_TZ,
-)
-from session_manager import get_client
+from ai.analyzer import generate_from_memory
+from config import AUTOPOST_LOOP_SEC, COPY_DELAY, POSTS_PER_DAY, POST_HOURS, SCHEDULE_TZ
 
 logger = logging.getLogger(__name__)
 
 _task: asyncio.Task | None = None
 _run_flag = asyncio.Event()
 
-# ключи в таблице settings
 _CURSOR_KEY = "schedule_cursor"
 _LAST_KEY = "schedule_last"
 
@@ -85,7 +74,7 @@ def _today() -> str:
 
 async def cycle() -> None:
     now = time.time()
-    # 1) отложенные посты и реклама
+
     for post in await db.get_pending_due(now):
         try:
             if await publish_post(post["id"]):
@@ -100,15 +89,10 @@ async def cycle() -> None:
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка публикации рекламы #%s: %s", ad["id"], e)
 
-    if await get_client() is None:
-        return
-
-    # 2) авто-расписание по слотам времени
     if POSTS_PER_DAY and POST_HOURS:
         await _run_schedule()
         return
 
-    # 3) интервальный режим (fallback)
     for ch in await db.get_channels(active_only=True):
         interval = max(int(ch.get("post_interval_min") or 60), 1) * 60
         if now - float(ch.get("last_post_time") or 0) < interval:
@@ -118,7 +102,6 @@ async def cycle() -> None:
 
 
 async def _run_schedule() -> None:
-    """Публикует пост, если наступил час-слот и в этот слот ещё не постили сегодня."""
     channels = [c for c in await db.get_channels(active_only=True)]
     if not channels:
         return
@@ -128,14 +111,12 @@ async def _run_schedule() -> None:
     if hour not in slots:
         return
 
-    # считаем индекс слота: сколько слотов уже прошло сегодня до текущего часа
     slot_index = len([h for h in slots if h <= hour])
     key = f"{_today()}:{slot_index}"
     last = await db.get_setting(_LAST_KEY, "")
     if last == key:
-        return  # в этот слот уже публиковали
+        return
 
-    # round-robin: следующий канал
     try:
         cursor = int(await db.get_setting(_CURSOR_KEY, "0"))
     except ValueError:
@@ -150,43 +131,24 @@ async def _run_schedule() -> None:
 
 
 async def auto_post_for(ch: dict) -> bool:
-    """Пытается опубликовать в канал: черновик → пост из памяти → из источника."""
     ch_id = ch["channel_id"]
 
-    # 1) если есть готовые черновики — публикуем самый свежий
     drafts = await db.get_draft_posts(ch_id)
     if drafts:
         post = drafts[0]
         ok = await publish_post(post["id"])
         return ok
 
-    # 2) генерируем из памяти
     memory = await db.get_recent_memory(ch_id, hours=48, min_importance=5, limit=8)
     if memory:
         result = await generate_from_memory(memory, ch.get("style_prompt", ""))
         if result.get("text"):
             media = memory[0].get("media_path") or ""
-            ok = await _publish(ch_id, result["text"], media=media,
+            media_url = memory[0].get("media_url") or ""
+            ok = await _publish(ch_id, result["text"], media=media, media_url=media_url,
                                 provider=result["provider"], model=result["model"])
             await asyncio.sleep(COPY_DELAY)
             return ok
-
-    # 3) генерируем из последнего поста источника
-    sources = await db.get_source_channels(ch_id)
-    for source in sources:
-        posts = await cp.fetch_recent_posts(source["source_channel_id"], limit=1)
-        if not posts:
-            continue
-        result = await generate_from_text(posts[0]["text"], ch.get("style_prompt", ""),
-                                          ch.get("custom_instruction", ""))
-        if result.get("text"):
-            ok = await _publish(ch_id, result["text"],
-                                source_id=source["source_channel_id"],
-                                source_post_id=posts[0]["id"],
-                                provider=result["provider"], model=result["model"])
-            await asyncio.sleep(COPY_DELAY)
-            return ok
-        break  # один источник на цикл
 
     return False
 
@@ -195,18 +157,17 @@ async def publish_post(post_id: int) -> bool:
     post = await db.get_post(post_id)
     if not post:
         return False
-    ok = await _publish(post["channel_id"], post["post_text"], post.get("post_media_path"))
+    ok = await _publish(post["channel_id"], post["post_text"],
+                        post.get("post_media_path"), post.get("post_media_url"))
     if ok:
         await db.update_post_status(post_id, "published")
     return ok
 
 
-async def _publish(channel_id: str, text: str, media: str = "",
-                   source_id: str = "", source_post_id: int = 0,
+async def _publish(channel_id: str, text: str, media: str = "", media_url: str = "",
                    provider: str = "", model: str = "") -> bool:
-    ok = await cp.send_post(channel_id, text, media or None)
+    ok = await cp.send_post(channel_id, text, media or None, media_url or None)
     if ok:
-        await db.save_post(channel_id=channel_id, text=text, media=media,
-                           source_id=source_id, source_post_id=source_post_id,
+        await db.save_post(channel_id=channel_id, text=text, media=media, media_url=media_url,
                            ai_provider=provider, ai_model=model)
     return ok

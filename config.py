@@ -7,11 +7,10 @@ load_dotenv()
 # ---------------------------------------------------------------- пути и данные
 DATA_DIR = os.getenv("DATA_DIR", "data")
 DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "bot_data.db"))
-SESSIONS_DIR = os.getenv("SESSIONS_DIR", os.path.join(DATA_DIR, "sessions"))
 MEDIA_DIR = os.getenv("MEDIA_DIR", os.path.join(DATA_DIR, "media"))
 LOG_FILE = os.getenv("LOG_FILE", "")
 
-for _d in (DATA_DIR, SESSIONS_DIR, MEDIA_DIR):
+for _d in (DATA_DIR, MEDIA_DIR):
     os.makedirs(_d, exist_ok=True)
 
 
@@ -49,13 +48,8 @@ def _csv_int(name: str) -> list[int]:
 # ------------------------------------------------------------- Telegram / бот
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = _csv_int("ADMIN_IDS") or ([_int("ADMIN_ID", 0)] if os.getenv("ADMIN_ID") else [])
-API_ID = _int("API_ID", 0)
-API_HASH = os.getenv("API_HASH", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 
 # ------------------------------------------------------------ AI провайдеры
-# Ключи задаются через *_KEYS (через запятую — несколько ключей для ротации),
-# либо одним *_API_KEY (обратная совместимость).
 def _ai_keys(plural: str, single: str) -> list[str]:
     vals = _csv(plural)
     if not vals and os.getenv(single):
@@ -84,7 +78,6 @@ GROQ_MODELS = _ai_models("GROQ_MODELS", ["llama-3.3-70b-versatile"])
 MISTRAL_MODELS = _ai_models("MISTRAL_MODELS", ["mistral-small-latest"])
 CEREBRAS_MODELS = _ai_models("CEREBRAS_MODELS", ["llama3.3-70b"])
 
-# Спецификации провайдеров (kind = формат API, как у OpenAI или Gemini).
 PROVIDERS: dict[str, dict] = {
     "openrouter": {
         "kind": "openai",
@@ -118,7 +111,6 @@ PROVIDERS: dict[str, dict] = {
     },
 }
 
-# Ключи из окружения по провайдеру (для первичного seeding в БД).
 ENV_KEYS_BY_PROVIDER = {
     "openrouter": OPENROUTER_KEYS,
     "gemini": GEMINI_KEYS,
@@ -127,33 +119,36 @@ ENV_KEYS_BY_PROVIDER = {
     "cerebras": CEREBRAS_KEYS,
 }
 
-# Лимит последовательных ошибок до авто-отключения ключа.
 AI_MAX_FAILS = _int("AI_MAX_FAILS", 5)
 
 # ------------------------------------------------------- мониторинг и постинг
 MONITOR_INTERVAL_SEC = _int("MONITOR_INTERVAL_SEC", 60)
-MONITOR_LOOKBACK = _int("MONITOR_LOOKBACK", 15)       # сколько последних постов перечитывать за цикл
-BACKFILL_LIMIT = _int("BACKFILL_LIMIT", 20)            # глубина истории для кнопки «заполнить память»
-IMPORTANCE_MIN = _int("IMPORTANCE_MIN", 5)            # порог важности для сохранения в память
-POST_INTERVAL_DEFAULT = _int("POST_INTERVAL_DEFAULT", 60)  # минут
+IMPORTANCE_MIN = _int("IMPORTANCE_MIN", 5)
+POST_INTERVAL_DEFAULT = _int("POST_INTERVAL_DEFAULT", 60)
 AUTOPOST_LOOP_SEC = _int("AUTOPOST_LOOP_SEC", 60)
-FETCH_POST_DELAY = _float("FETCH_POST_DELAY", 1.0)    # пауза между постами при анализе
 COPY_DELAY = _float("COPY_DELAY", 2.0)
 
-# Авто-расписание: сколько постов в день и в какие часы (Московское время, MSK)
-# публиковать. Часы считаются в таймзоне Europe/Moscow независимо от хоста.
-# POSTS_PER_DAY=0 отключает авто-расписание (остаются обычные интервалы).
 POSTS_PER_DAY = _int("POSTS_PER_DAY", 4)
 POST_HOURS = _csv_int("POST_HOURS") or ([9, 13, 18, 21] if POSTS_PER_DAY >= 4 else [12, 18])
-# Таймзона для расписания публикаций (по умолчанию московская).
 SCHEDULE_TZ = os.getenv("SCHEDULE_TZ", "Europe/Moscow")
 
 MAX_TEXT_LEN = _int("MAX_TEXT_LEN", 4096)
 MAX_CAPTION_LEN = _int("MAX_CAPTION_LEN", 1024)
 MAX_INPUT_POST_LEN = _int("MAX_INPUT_POST_LEN", 3000)
 
-AI_TIMEOUT = _int("AI_TIMEOUT", 90)                   # HTTP timeout для AI
-KEY_POOL_TTL = _int("KEY_POOL_TTL", 60)               # перечитывать ключи каждые N сек
+AI_TIMEOUT = _int("AI_TIMEOUT", 90)
+KEY_POOL_TTL = _int("KEY_POOL_TTL", 60)
+
+# ------------------------------------------------------- web-парсер
+WEB_TIMEOUT = _int("WEB_TIMEOUT", 20)
+WEB_USER_AGENT = os.getenv(
+    "WEB_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+)
+WEB_COLLECT_INTERVAL_MIN = _int("WEB_COLLECT_INTERVAL_MIN", 360)
+WEB_MAX_ITEMS = _int("WEB_MAX_ITEMS", 6)
+WEB_MAX_QUERIES = _int("WEB_MAX_QUERIES", 2)
 
 # ---------------------------------------------------------------- логирование
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()

@@ -7,21 +7,20 @@ import sys
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder
 
-import database as db
 import channel_parser
+import database as db
 import handlers
 import monitor
 import scheduler
-import session_manager as sess
+import web_monitor
 from ai import providers as ai_providers
-from config import DATA_DIR, LOG_FILE, LOG_LEVEL, BOT_TOKEN, DB_PATH
+from config import BOT_TOKEN, DATA_DIR, DB_PATH, LOG_FILE, LOG_LEVEL
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
-
 
 if LOG_FILE:
     try:
@@ -45,7 +44,7 @@ def main() -> None:
         .build()
     )
     handlers.register(app)
-    logger.info("Бот запускается…")
+    logger.info("Бот запускается...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
@@ -53,29 +52,19 @@ async def post_init(app: Application) -> None:
     await db.init_db()
     await ai_providers.startup()
 
-    # подключаем аккаунт, если есть сессия (не критично для старта бота)
-    try:
-        await sess.init_client()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Не удалось инициализировать аккаунт на старте: %s", e)
-
-    # предзагружаем диалоги в фон, чтобы мониторинг сразу умел резолвить
-    # числовые ID каналов без долгой паузы на первом цикле
-    try:
-        await channel_parser.preload_dialogs()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Не удалось предзагрузить диалоги: %s", e)
+    channel_parser.set_bot(app.bot)
 
     await monitor.start()
     await scheduler.start()
-    logger.info("БД, AI, мониторинг и автопостинг готовы. БД: %s", DB_PATH)
+    await web_monitor.start()
+    logger.info("БД, AI, мониторинг, автопостинг и web-сбор готовы. БД: %s", DB_PATH)
 
 
 async def post_shutdown(app: Application) -> None:
     await monitor.stop()
     await scheduler.stop()
+    await web_monitor.stop()
     await ai_providers.shutdown()
-    await sess.disconnect()
     await db.close_db()
     logger.info("Остановка завершена")
 
