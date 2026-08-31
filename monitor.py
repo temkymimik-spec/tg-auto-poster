@@ -8,7 +8,7 @@ import logging
 
 import channel_parser as cp
 import database as db
-from ai.analyzer import analyze_post
+from ai.analyzer import analyze_post, is_reklama
 from config import FETCH_POST_DELAY, IMPORTANCE_MIN, MONITOR_INTERVAL_SEC, MONITOR_LOOKBACK
 from session_manager import get_client
 
@@ -74,6 +74,12 @@ async def _process_post(stats: dict, m, ch: dict, source_ref: str) -> None:
     text = (m.text or "").strip()
     if not text:
         return  # чистый медиа-пост без текста — переписывать нечего
+
+    # Быстрая дешёвая проверка: AI отвечает одним числом 0/1.
+    # Если явная реклама — скипаем сразу, без полного анализа (быстрее и дешевле).
+    if await is_reklama(text):
+        stats["skipped"] += 1
+        return
 
     analysis = await analyze_post(text, "")
     if analysis.get("is_ad"):

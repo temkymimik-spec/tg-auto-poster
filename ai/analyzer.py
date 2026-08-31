@@ -3,6 +3,7 @@ import logging
 
 from ai import providers
 from ai.prompts import (
+    AD_FILTER_SYSTEM,
     ANALYZE_SYSTEM,
     COPYWRITER_SYSTEM,
     MEMORY_WRITER_SYSTEM,
@@ -12,6 +13,26 @@ from ai.prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def is_reklama(post_text: str) -> bool:
+    """Быстрый дешёвый фильтр рекламы: AI отвечает одним числом 0 или 1.
+
+    Возвращает True, если пост — явная реклама (пост целиком про продажу).
+    """
+    text = (post_text or "").strip()[:2000]
+    if not text:
+        return False
+    try:
+        raw, _, _ = await providers.generate(
+            AD_FILTER_SYSTEM,
+            f"Пост:\n{text}\n\nРеклама? Ответь ТОЛЬКО 0 или 1.",
+            temperature=0.0,
+            max_tokens=5,
+        )
+        return raw.strip() == "1"
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _default_result() -> dict:
@@ -35,12 +56,14 @@ async def analyze_post(post_text: str, channel_context: str = "") -> dict:
         emotion = data.get("emotion", "neutral")
         if emotion not in ("positive", "negative", "neutral", "urgent"):
             emotion = "neutral"
-        is_ad = 1 if str(data.get("is_ad", "0")).strip() in ("1", "true", "True", "yes") else 0
-        if is_ad:
-            importance = 1
         post_type = str(data.get("post_type", "content")).strip().lower()
         if post_type not in ("content", "prompt", "news", "instruction", "promo"):
             post_type = "content"
+        # реклама — только явно promo-посты. Всё остальное (контент/промпт/новости/
+        # инструкции) НИКОГДА не считается рекламой и не пропускается.
+        is_ad = 1 if post_type == "promo" else 0
+        if is_ad:
+            importance = 1
         return {
             "topic": str(data.get("topic", ""))[:120],
             "summary": str(data.get("summary", ""))[:500],
