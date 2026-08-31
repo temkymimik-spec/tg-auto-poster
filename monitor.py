@@ -57,30 +57,24 @@ async def cycle() -> None:
         sources = await db.get_source_channels(ch["channel_id"])
         if not sources:
             continue
-        await analyze_channel(ch, sources)
+        state = await db.get_monitor_state(ch["channel_id"])
+        await analyze_channel(ch, sources, state)
 
 
-async def analyze_channel(ch: dict, sources: list[dict], state: dict | None = None,
+async def analyze_channel(ch: dict, sources: list[dict], state: dict,
                           lookback: int | None = None) -> dict:
-    """Анализирует новые посты по источникам канала. Возвращает статистику прогона.
-
-    Курсор (last_post_id) ведётся отдельно для каждого источника, чтобы каналы
-    с разными диапазонами ID не блокировали друг друга.
-    """
+    """Анализирует новые посты по источникам канала. Возвращает статистику прогона."""
     lookback = lookback or MONITOR_LOOKBACK
     client = await get_client()
     if client is None:
         return {"error": "аккаунт не подключён"}
 
-    stats = {"new_posts": 0, "saved": 0, "analyzed_fail": 0, "skipped": 0}
+    stats = {"new_posts": 0, "saved": 0, "analyzed_fail": 0}
+    last_id = state.get("last_post_id", 0)
+    new_last = last_id
 
     for source in sources:
         source_ref = source["source_channel_id"]
-        st = await db.get_monitor_state(ch["channel_id"], source_channel_id=source_ref)
-        last_id = st.get("last_post_id", 0)
-        new_last = last_id
-        src_failed = False
-
         try:
             async for m in cp.iter_new_posts(source_ref, after_id=last_id, limit=lookback):
                 if m.id <= last_id:
@@ -89,36 +83,28 @@ async def analyze_channel(ch: dict, sources: list[dict], state: dict | None = No
                 new_last = max(new_last, m.id)
 
                 analysis = await analyze_post(m.text, source.get("source_channel_title", ""))
-                importance = analysis.get("importance", 1)
-                if analysis.get("analyze_failed"):
-                    # AI-анализ не удался — не продвигаем курсор, попробуем позже
-                    stats["analyzed_fail"] += 1
-                    src_failed = True
-                elif importance >= IMPORTANCE_MIN:
+                if analysis.get("importance", 1) >= IMPORTANCE_MIN:
                     await db.save_to_memory(
                         channel_id=ch["channel_id"],
                         source_channel_id=source_ref,
                         topic=analysis.get("topic", ""),
                         summary=analysis.get("summary", ""),
                         keywords=analysis.get("keywords", ""),
-                        importance=importance,
+                        importance=analysis.get("importance", 5),
                         emotion=analysis.get("emotion", "neutral"),
                         raw_text=m.text[:3000],
                         source_post_id=m.id,
                     )
                     stats["saved"] += 1
-                else:
-                    # пост реально оказался неважным — пропускаем, курсор двигаем
-                    stats["skipped"] += 1
+                elif analysis.get("importance", 1) == 0:
+                    stats["analyzed_fail"] += 1
 
                 await asyncio.sleep(FETCH_POST_DELAY)
         except Exception as e:  # noqa: BLE001
             logger.warning("Ошибка мониторинга источника %s: %s", source_ref, e)
-            src_failed = True
 
-        # продвигаем курсор источника только если анализ прошёл стабильно
-        if new_last > last_id and not src_failed:
-            await db.update_monitor_state(ch["channel_id"], new_last, source_channel_id=source_ref)
+    if new_last > last_id:
+        await db.update_monitor_state(ch["channel_id"], new_last)
 
     logger.info("Мониторинг %s: %s", ch.get("channel_title", ch["channel_id"]), stats)
     return stats

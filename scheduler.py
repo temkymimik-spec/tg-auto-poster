@@ -1,18 +1,35 @@
-"""Автопостинг: публикация отложенных постов/рекламы и генерация по расписанию."""
+"""Автопостинг: публикация отложенных постов/рекламы и авто-расписание.
+
+Два режима:
+1) Точное расписание: POSTS_PER_DAY раз в день в заданные часы (POST_HOURS)
+   публикуется один сгенерированный пост. Канал выбирается по кругу (round-robin)
+   среди активных каналов.
+2) Интервальный (fallback, когда POSTS_PER_DAY=0): каждый канал публикует
+   по своему интервалу post_interval_min.
+"""
 import asyncio
 import logging
 import time
 
 import channel_parser as cp
 import database as db
-from ai.analyzer import generate_from_text
-from config import AUTOPOST_LOOP_SEC, COPY_DELAY, POST_INTERVAL_DEFAULT
+from ai.analyzer import generate_from_memory, generate_from_text
+from config import (
+    AUTOPOST_LOOP_SEC,
+    COPY_DELAY,
+    POSTS_PER_DAY,
+    POST_HOURS,
+)
 from session_manager import get_client
 
 logger = logging.getLogger(__name__)
 
 _task: asyncio.Task | None = None
 _run_flag = asyncio.Event()
+
+# ключи в таблице settings
+_CURSOR_KEY = "schedule_cursor"
+_LAST_KEY = "schedule_last"
 
 
 def is_running() -> bool:
@@ -50,6 +67,10 @@ async def _loop() -> None:
             pass
 
 
+def _today() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
 async def cycle() -> None:
     now = time.time()
     # 1) отложенные посты и реклама
@@ -67,15 +88,53 @@ async def cycle() -> None:
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка публикации рекламы #%s: %s", ad["id"], e)
 
-    # 2) авто-генерация по интервалу
     if await get_client() is None:
         return
+
+    # 2) авто-расписание по слотам времени
+    if POSTS_PER_DAY and POST_HOURS:
+        await _run_schedule()
+        return
+
+    # 3) интервальный режим (fallback)
     for ch in await db.get_channels(active_only=True):
-        interval = max(int(ch.get("post_interval_min") or POST_INTERVAL_DEFAULT), 1) * 60
+        interval = max(int(ch.get("post_interval_min") or 60), 1) * 60
         if now - float(ch.get("last_post_time") or 0) < interval:
             continue
         await auto_post_for(ch)
         await db.update_channel(ch["channel_id"], last_post_time=time.time())
+
+
+async def _run_schedule() -> None:
+    """Публикует пост, если наступил час-слот и в этот слот ещё не постили сегодня."""
+    channels = [c for c in await db.get_channels(active_only=True)]
+    if not channels:
+        return
+
+    hour = time.localtime().tm_hour
+    slots = sorted(POST_HOURS)
+    if hour not in slots:
+        return
+
+    # считаем индекс слота: сколько слотов уже прошло сегодня до текущего часа
+    slot_index = len([h for h in slots if h <= hour])
+    key = f"{_today()}:{slot_index}"
+    last = await db.get_setting(_LAST_KEY, "")
+    if last == key:
+        return  # в этот слот уже публиковали
+
+    # round-robin: следующий канал
+    try:
+        cursor = int(await db.get_setting(_CURSOR_KEY, "0"))
+    except ValueError:
+        cursor = 0
+    ch = channels[cursor % len(channels)]
+    cursor = (cursor + 1) % len(channels)
+    await db.set_setting(_CURSOR_KEY, str(cursor))
+
+    logger.info("Авто-расписание: слот %d, публикую в %s", hour, ch.get("channel_title") or ch["channel_id"])
+    await auto_post_for(ch)
+    await db.set_setting(_LAST_KEY, key)
 
 
 async def auto_post_for(ch: dict) -> bool:
@@ -90,9 +149,8 @@ async def auto_post_for(ch: dict) -> bool:
         return ok
 
     # 2) генерируем из памяти
-    memory = await db.get_recent_memory(ch_id, hours=48, min_importance=3, limit=10)
+    memory = await db.get_recent_memory(ch_id, hours=48, min_importance=5, limit=8)
     if memory:
-        from ai.analyzer import generate_from_memory
         result = await generate_from_memory(memory, ch.get("style_prompt", ""))
         if result.get("text"):
             ok = await _publish(ch_id, result["text"], provider=result["provider"], model=result["model"])

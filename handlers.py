@@ -30,6 +30,8 @@ from config import (
     API_ID,
     PROVIDERS,
     BOT_TOKEN,
+    POSTS_PER_DAY,
+    POST_HOURS,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,6 +120,7 @@ async def send_status(msg: Message) -> None:
     stats = await db.get_stats()
     pending_posts = stats["posts_pending"]
     pending_ads = stats["ads_pending"]
+    schedule = f"{POSTS_PER_DAY} поста в {POST_HOURS}" if POSTS_PER_DAY and POST_HOURS else "интервалы"
 
     text = (
         f"*📊 Статус*\n\n"
@@ -129,7 +132,8 @@ async def send_status(msg: Message) -> None:
         f"📝 Ожидают: посты {pending_posts}, реклама {pending_ads}\n"
         f"🧠 Записей памяти: {stats['memory_total']}\n"
         f"⏱ Мониторинг: {'✅ вкл' if monitor.is_running() else '❌ выкл'}\n"
-        f"⏱ Автопостинг: {'✅ вкл' if scheduler.is_running() else '❌ выкл'}"
+        f"⏱ Автопостинг: {'✅ вкл' if scheduler.is_running() else '❌ выкл'}\n"
+        f"📅 Расписание: {schedule}"
     )
     await msg.reply_text(text, parse_mode="Markdown")
 
@@ -171,6 +175,7 @@ async def channel_open(update: Update, context: ContextTypes.DEFAULT_TYPE, chann
         [InlineKeyboardButton("⏱ Интервал", callback_data=f"ch_interval|{channel_id}")],
         [InlineKeyboardButton("🟢/🔴 Вкл/Выкл", callback_data=f"ch_toggle|{channel_id}")],
         [InlineKeyboardButton("🔄 Сгенерировать", callback_data=f"ch_gen|{channel_id}")],
+        [InlineKeyboardButton("⚡ Выложить сейчас", callback_data=f"ch_now|{channel_id}")],
         [InlineKeyboardButton("📥 Посты", callback_data=f"ch_posts|{channel_id}")],
         [InlineKeyboardButton("📡 Источники", callback_data=f"ch_sources|{channel_id}")],
         [InlineKeyboardButton("🧠 Память", callback_data=f"mem_stats|{channel_id}")],
@@ -234,7 +239,7 @@ async def channel_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         await query.edit_message_text("Канал не найден.")
         await query.answer()
         return
-    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=3, limit=10)
+    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=5, limit=8)
     result = None
     if memory:
         result = await generate_from_memory(memory, ch.get("style_prompt", ""))
@@ -263,6 +268,32 @@ async def channel_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, c
     await query.edit_message_text(
         f"🤖 *Пост* `{result['provider']}/{result['model']}`\n\n---\n{preview}\n---",
         reply_markup=kb(keyboard), parse_mode="Markdown",
+    )
+    await query.answer()
+
+
+async def channel_generate_now(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
+    """Генерирует пост и сразу публикует в канал."""
+    query = update.callback_query
+    ch = await db.get_channel(channel_id)
+    if not ch:
+        await query.edit_message_text("Канал не найден.", reply_markup=kb([[back_btn("menu_channels")]]))
+        return
+    try:
+        await query.edit_message_text(f"⚡ Генерирую и публикую в «{ch.get('channel_title') or channel_id}»…")
+    except Exception:  # noqa: BLE001
+        pass
+    # пока идёт AI — обновляем статус отдельным сообщением, чтобы не залипнуть
+    status_msg = await query.message.reply_text("🧠 AI думает над постом…")
+    ok = await scheduler.auto_post_for(ch)
+    try:
+        await status_msg.edit_text("✅ Пост сгенерирован и опубликован!" if ok else
+                                   "❌ Не удалось (нет AI-ключей/источников или аккаунт не готов).")
+    except Exception:  # noqa: BLE001
+        pass
+    await query.edit_message_text(
+        "✅ Готово." if ok else "❌ Не удалось опубликовать.",
+        reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
     )
     await query.answer()
 
@@ -461,7 +492,7 @@ async def mem_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, chann
     query = update.callback_query
     ch = await db.get_channel(channel_id)
     await query.edit_message_text("🔄 Генерирую из памяти…")
-    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=3, limit=10)
+    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=5, limit=8)
     result = await generate_from_memory(memory, (ch.get("style_prompt") if ch else ""))
     if result.get("text"):
         post_id = await db.save_post(channel_id, result["text"],
@@ -816,7 +847,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "memory_gen_topic" and extra:
         await update.message.reply_text("🔄 Генерирую…")
         ch = await db.get_channel(extra)
-        memory = await db.get_recent_memory(extra, hours=48, min_importance=3, limit=10)
+        memory = await db.get_recent_memory(extra, hours=48, min_importance=5, limit=8)
         result = await generate_from_memory(memory, (ch.get("style_prompt") if ch else ""), target_topic=text)
         if result.get("text"):
             post_id = await db.save_post(extra, result["text"],
@@ -902,6 +933,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not is_admin(q.from_user.id):
         await q.answer("Нет доступа", show_alert=True)
         return
+    # Отвечаем на callback НЕМЕДЛЕННО, чтобы Telegram не отдал
+    # "Query is too old". Тяжёлые операции (AI, сеть) идут после,
+    # а редактура сообщения (edit_message_text) работает и после answer().
+    try:
+        await q.answer()
+    except Exception:  # noqa: BLE001
+        pass
     data = q.data
 
     # простая таблица маршрутов
@@ -945,6 +983,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await channel_interval(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_gen|"):
         await channel_generate(update, context, data.split("|", 1)[1])
+    elif data.startswith("ch_now|"):
+        await channel_generate_now(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_posts|"):
         await channel_posts(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_sources|"):

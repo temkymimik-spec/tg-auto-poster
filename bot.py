@@ -8,6 +8,7 @@ from telegram import Update
 from telegram.ext import Application, ApplicationBuilder
 
 import database as db
+import channel_parser
 import handlers
 import monitor
 import scheduler
@@ -39,7 +40,6 @@ def main() -> None:
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -58,6 +58,13 @@ async def post_init(app: Application) -> None:
         await sess.init_client()
     except Exception as e:  # noqa: BLE001
         logger.warning("Не удалось инициализировать аккаунт на старте: %s", e)
+
+    # предзагружаем диалоги в фон, чтобы мониторинг сразу умел резолвить
+    # числовые ID каналов без долгой паузы на первом цикле
+    try:
+        await channel_parser.preload_dialogs()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось предзагрузить диалоги: %s", e)
 
     await monitor.start()
     await scheduler.start()

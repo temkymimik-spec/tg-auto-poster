@@ -90,8 +90,7 @@ CREATE TABLE IF NOT EXISTS memory (
     emotion TEXT DEFAULT 'neutral',
     raw_text TEXT DEFAULT '',
     source_post_id INTEGER DEFAULT 0,
-    created_at REAL DEFAULT 0,
-    UNIQUE(channel_id, source_channel_id, source_post_id)
+    created_at REAL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS monitor_state (
@@ -115,6 +114,10 @@ STATS_CACHE_KEY = "stats_json_cache"
 
 
 # ------------------------------------------------------------- коннект к БД
+_conn: None
+_conn_closed = False
+
+
 async def get_conn() -> aiosqlite.Connection:
     global _conn, _conn_closed
     if _conn is None or _conn_closed:
@@ -456,7 +459,7 @@ async def save_to_memory(channel_id: str, source_channel_id: str, topic: str, su
     conn = await get_conn()
     async with _write_lock:
         cur = await conn.execute(
-            "INSERT OR IGNORE INTO memory (channel_id, source_channel_id, topic, summary, keywords,"
+            "INSERT INTO memory (channel_id, source_channel_id, topic, summary, keywords,"
             " importance, emotion, raw_text, source_post_id, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (channel_id, source_channel_id, topic, summary, keywords,
@@ -475,8 +478,8 @@ async def get_memory(channel_id: str, limit: int = 20) -> list[dict]:
     return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_recent_memory(channel_id: str, hours: int = 48, min_importance: int = 1, limit: int = 10) -> list[dict]:
-    since = time.time() - max(hours, 1) * 3600
+async def get_recent_memory(channel_id: str, hours: int = 48, min_importance: int = 5, limit: int = 10) -> list[dict]:
+    since = time.time() - hours * 3600
     conn = await get_conn()
     cur = await conn.execute(
         "SELECT * FROM memory WHERE channel_id=? AND created_at>? AND importance>=?"
@@ -519,26 +522,24 @@ async def delete_memory_entry(entry_id: int) -> None:
         await conn.commit()
 
 
-async def update_monitor_state(channel_id: str, last_post_id: int, source_channel_id: str = "") -> None:
-    key = f"{channel_id}|{source_channel_id}" if source_channel_id else channel_id
+async def update_monitor_state(channel_id: str, last_post_id: int) -> None:
     conn = await get_conn()
     async with _write_lock:
         await conn.execute(
             "INSERT OR REPLACE INTO monitor_state (channel_id, last_post_id, last_check_time)"
             " VALUES (?, ?, ?)",
-            (key, last_post_id, time.time()),
+            (channel_id, last_post_id, time.time()),
         )
         await conn.commit()
 
 
-async def get_monitor_state(channel_id: str, source_channel_id: str = "") -> dict:
-    key = f"{channel_id}|{source_channel_id}" if source_channel_id else channel_id
+async def get_monitor_state(channel_id: str) -> dict:
     conn = await get_conn()
-    cur = await conn.execute("SELECT * FROM monitor_state WHERE channel_id=?", (key,))
+    cur = await conn.execute("SELECT * FROM monitor_state WHERE channel_id=?", (channel_id,))
     row = await cur.fetchone()
     if row:
         return dict(row)
-    return {"channel_id": key, "last_post_id": 0, "last_check_time": 0}
+    return {"channel_id": channel_id, "last_post_id": 0, "last_check_time": 0}
 
 
 # -------------------------------------------------------------------- статы
