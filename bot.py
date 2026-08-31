@@ -12,7 +12,6 @@ import database as db
 import handlers
 import monitor
 import scheduler
-import web_monitor
 from ai import providers as ai_providers
 from config import BOT_TOKEN, DATA_DIR, DB_PATH, LOG_FILE, LOG_LEVEL
 
@@ -56,14 +55,12 @@ async def post_init(app: Application) -> None:
 
     await monitor.start()
     await scheduler.start()
-    await web_monitor.start()
-    logger.info("БД, AI, мониторинг, автопостинг и web-сбор готовы. БД: %s", DB_PATH)
+    logger.info("БД, AI, мониторинг и автопостинг готовы. БД: %s", DB_PATH)
 
 
 async def post_shutdown(app: Application) -> None:
     await monitor.stop()
     await scheduler.stop()
-    await web_monitor.stop()
     await ai_providers.shutdown()
     await db.close_db()
     logger.info("Остановка завершена")

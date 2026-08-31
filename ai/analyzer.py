@@ -1,34 +1,65 @@
 """AI-анализ постов и генерация контента."""
 import logging
+from datetime import datetime
 
 from ai import providers
 from ai.prompts import (
     ANALYZE_SYSTEM,
-    COPYWRITER_SYSTEM,
+    CONTENT_SYSTEM,
     MEMORY_WRITER_SYSTEM,
-    QUERY_SYSTEM,
     analyze_prompt,
-    copywrite_prompt,
+    content_prompt,
     memory_prompt,
 )
 
 logger = logging.getLogger(__name__)
 
 
-async def make_search_queries(channel_theme: str) -> list[str]:
-    """Генерирует 1-2 поисковых запроса по описанию темы канала."""
-    theme = (channel_theme or "").strip()
-    if not theme:
+def _season(month: int) -> str:
+    if month in (12, 1, 2):
+        return "зима"
+    if month in (3, 4, 5):
+        return "весна"
+    if month in (6, 7, 8):
+        return "лето"
+    return "осень"
+
+
+async def generate_content_items(channel_desc: str, style_prompt: str = "") -> list[dict]:
+    """AI сам генерит готовые посты по описанию канала + текущая дата.
+
+    Возвращает [{topic, content}]. Без интернета, только знания модели.
+    """
+    desc = (channel_desc or "").strip()
+    if not desc:
         return []
-    user = f"Тематика канала:\n{theme}\n\nПридумай поисковые запросы."
+    today = datetime.now()
+    _m = today.month
+    _months = ("январе", "феврале", "марте", "апреле", "мае", "июне",
+               "июле", "августе", "сентябре", "октябре", "ноябре", "декабре")
+    month_name = _months[_m - 1]
+    season = _season(_m)
+    system = CONTENT_SYSTEM.format(
+        today=today.strftime("%d.%m.%Y"),
+        month=month_name,
+        season=season,
+    )
+    user = content_prompt(desc, style_prompt)
     try:
-        data = await providers.parse_json_ai(QUERY_SYSTEM, user, temperature=0.4, max_tokens=300)
-        queries = data.get("queries") or []
-        if not isinstance(queries, list):
+        data = await providers.parse_json_ai(system, user, temperature=0.8, max_tokens=4000)
+        items = data.get("items") or []
+        if not isinstance(items, list):
             return []
-        out = [str(q).strip() for q in queries if str(q).strip()]
-        return out[:3]
-    except Exception:  # noqa: BLE001
+        out = []
+        for it in items:
+            if isinstance(it, dict) and it.get("content"):
+                out.append({
+                    "topic": str(it.get("topic", ""))[:150],
+                    "content": str(it["content"]).strip(),
+                })
+        return out
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось сгенерировать контент: %s", e)
         return []
 
 

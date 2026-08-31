@@ -109,8 +109,44 @@ async def init_db() -> None:
     async with _write_lock:
         await conn.executescript(SCHEMA)
         await _migrate(conn)
+        await _fix_broken_memory(conn)
         await conn.commit()
     await _seed_ai_keys()
+
+
+async def _fix_broken_memory(conn) -> None:
+    """Если таблица memory из старой схемы (нет нужных колонок) — пересоздаём её.
+
+    Из-за старых таблиц без media_path/source_url/media_url сохранение падает.
+    Проще пересоздать таблицу памяти заново, чем мучить миграцию колонок.
+    """
+    try:
+        cur = await conn.execute("PRAGMA table_info(memory)")
+        rows = await cur.fetchall()
+        cols = {row[1] for row in rows}
+        required = {"media_path", "source_url", "media_url"}
+        if required.issubset(cols):
+            return
+        logger.warning("memory-таблица старой схемы (%s), пересоздаю…", sorted(cols))
+        await conn.execute("DROP TABLE IF EXISTS memory")
+        await conn.execute("""
+            CREATE TABLE memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT NOT NULL,
+                source_url TEXT DEFAULT '',
+                topic TEXT DEFAULT '',
+                summary TEXT DEFAULT '',
+                keywords TEXT DEFAULT '',
+                importance INTEGER DEFAULT 5,
+                emotion TEXT DEFAULT 'neutral',
+                raw_text TEXT DEFAULT '',
+                media_path TEXT DEFAULT '',
+                media_url TEXT DEFAULT '',
+                created_at REAL DEFAULT 0
+            )
+        """)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось проверить/пересоздать memory: %s", e)
 
 
 async def _migrate(conn) -> None:

@@ -65,12 +65,12 @@ async def show_main(msg) -> None:
     keyboard = [
         [InlineKeyboardButton("📺 Каналы", callback_data="menu_channels")],
         [InlineKeyboardButton("🧠 Память", callback_data="menu_memory")],
-        [InlineKeyboardButton("🔎 Собрать из инета (кнопка сбора)", callback_data="menu_collect")],
+        [InlineKeyboardButton("🧠 Сгенерировать контент (кнопка сбора)", callback_data="menu_collect")],
         [InlineKeyboardButton("🤖 AI", callback_data="menu_ai")],
         [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
         [InlineKeyboardButton("📢 Рассылка", callback_data="broadcast")],
     ]
-    text = "🤖 *Auto-Poster*\nБот ищет контент в интернете по описанию каналов и ведёт их.\n\nИспользуй кнопки ниже."
+    text = "🤖 *Auto-Poster*\nБот сам ведёт каналы по их описанию (ИИ генерит контент).\n\nИспользуй кнопки ниже."
     if callable(getattr(msg, "edit_message_text", None)):
         await msg.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
     else:
@@ -139,7 +139,7 @@ async def channel_add_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "✏️ Отправь @username ID канала или ссылку.\n"
         "Важно: бот должен быть администратором этого канала.\n"
         "После добавления обязательно опиши, о чём канал (кнопка «✏️ Описание») — "
-        "по этому описанию бот будет искать контент в интернете.",
+        "по этому описанию бот сам будет вести канал и генерить посты.",
     )
     await safe_answer(query)
 
@@ -167,8 +167,9 @@ async def channel_open(update: Update, context: ContextTypes.DEFAULT_TYPE, chann
         [InlineKeyboardButton("⏱ Интервал", callback_data=f"ch_interval|{channel_id}")],
         [InlineKeyboardButton("🟢/🔴 Вкл/Выкл", callback_data=f"ch_toggle|{channel_id}")],
         [InlineKeyboardButton("🔄 Сгенерировать пост из памяти", callback_data=f"ch_gen|{channel_id}")],
+        [InlineKeyboardButton("🧪 Тест поста (не публикует)", callback_data=f"ch_test|{channel_id}")],
         [InlineKeyboardButton("⚡ Выложить сейчас", callback_data=f"ch_now|{channel_id}")],
-        [InlineKeyboardButton("🔎 Собрать инфу сейчас", callback_data=f"ch_collect|{channel_id}")],
+        [InlineKeyboardButton("🧠 Сгенерировать контент", callback_data=f"ch_collect|{channel_id}")],
         [InlineKeyboardButton("📥 Черновики", callback_data=f"ch_posts|{channel_id}")],
         [InlineKeyboardButton("🧠 Память", callback_data=f"mem_stats|{channel_id}")],
         [InlineKeyboardButton("📢 Реклама", callback_data=f"ch_ads|{channel_id}")],
@@ -203,7 +204,7 @@ async def channel_description_prompt(update: Update, context: ContextTypes.DEFAU
         "📝 Опиши, о чём этот канал — тематику, аудиторию, что нужно публиковать.\n"
         "Например: «Канал про инвестиции в крипту для новичков, простым языком, "
         "новости и обзоры, без хайпа».\n\n"
-        "По этому описанию ИИ будет сам искать контент в интернете и вести канал.",
+        "По этому описанию ИИ будет сам генерить контент по описанию и вести канал.",
     )
     await safe_answer(query)
 
@@ -235,7 +236,7 @@ async def channel_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, c
     memory = await db.get_recent_memory(channel_id, hours=48, min_importance=5, limit=8)
     if not memory:
         await query.edit_message_text(
-            "❌ В памяти нет данных. Сначала нажми «🔎 Собрать инфу сейчас» "
+            "❌ В памяти нет данных. Сначала нажми «🧠 Сгенерировать контент» "
             "или задай описание канала.",
             reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
         )
@@ -260,6 +261,50 @@ async def channel_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         f"🤖 *Пост* `{result['provider']}/{result['model']}`\n\n---\n{result['text'][:1500]}\n---",
         reply_markup=kb(keyboard), parse_mode="Markdown",
     )
+    await safe_answer(query)
+
+
+async def channel_test(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
+    """Генерирует пост и показывает его в чате, НЕ публикуя."""
+    from ai.analyzer import generate_content_items
+    query = update.callback_query
+    ch = await db.get_channel(channel_id)
+    if not ch:
+        await query.edit_message_text("Канал не найден.", reply_markup=kb([[back_btn("menu_channels")]]))
+        await safe_answer(query)
+        return
+    await query.edit_message_text("🧪 Генерирую тестовый пост…")
+    try:
+        status_msg = await query.message.reply_text("🧠 AI думает…")
+    except Exception:  # noqa: BLE001
+        status_msg = None
+
+    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=5, limit=8)
+    if memory:
+        result = await generate_from_memory(memory, ch.get("style_prompt", ""))
+    else:
+        items = await generate_content_items(ch.get("channel_description", ""), ch.get("style_prompt", ""))
+        result = {"text": items[0]["content"] if items else "", "provider": "ai", "model": ""}
+
+    if not result.get("text"):
+        msg = "❌ Не удалось сгенерировать (задай описание канала или собери инфу)."
+        if status_msg is not None:
+            try:
+                await status_msg.edit_text(msg)
+            except Exception:  # noqa: BLE001
+                pass
+        await query.edit_message_text(msg, reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]))
+        await safe_answer(query)
+        return
+
+    text = f"🧪 *Тестовый пост* (не опубликован)\n\n---\n{result['text'][:1500]}\n---"
+    if status_msg is not None:
+        try:
+            await status_msg.edit_text(text, parse_mode="Markdown")
+        except Exception:  # noqa: BLE001
+            pass
+    await query.edit_message_text(text, reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
+                                  parse_mode="Markdown")
     await safe_answer(query)
 
 
@@ -303,7 +348,7 @@ async def channel_collect(update: Update, context: ContextTypes.DEFAULT_TYPE, ch
         )
         await safe_answer(query)
         return
-    await query.edit_message_text("🔎 Ищу контент в интернете по описанию канала… "
+    await query.edit_message_text("🧠 Генерирую контент по описанию канала… "
                                   "(это может занять 1-2 минуты)")
     status_msg = None
     try:
@@ -313,7 +358,7 @@ async def channel_collect(update: Update, context: ContextTypes.DEFAULT_TYPE, ch
     stats = await monitor.manual_collect(ch)
     await db.update_web_collect_state(channel_id)
     text = (
-        f"🔎 Сбор завершён.\n"
+        f"🧠 Генерация завершена.\n"
         f"Запросов сгенерировано: {stats.get('queries', 0)}\n"
         f"Сохранено в память: {stats.get('saved', 0)}\n"
         f"Ошибок: {stats.get('errors', 0)}"
@@ -410,11 +455,11 @@ async def menu_collect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         title = ch.get("channel_title") or ch["channel_id"]
         has_desc = "✅" if (ch.get("channel_description") or "").strip() else "❌"
         keyboard.append([InlineKeyboardButton(f"🔎 {has_desc} {title}", callback_data=f"ch_collect|{ch['channel_id']}")])
-    keyboard.append([InlineKeyboardButton("🔎 Собрать во всех каналах", callback_data="collect_all")])
+    keyboard.append([InlineKeyboardButton("🧠 Сгенерировать во всех каналах", callback_data="collect_all")])
     keyboard.append([back_btn()])
     await query.edit_message_text(
-        "🔎 *Сбор инфы из интернета*\n\n"
-        "Бот по описанию каждого канала сам придумает запросы и соберёт контент в память.\n"
+        "🧠 *Генерация контента*\n\n"
+        "Бот по описанию каждого канала сам генерит контент и сохраняет в память.\n"
         "✅ = описание задано, ❌ = нет описания.",
         reply_markup=kb(keyboard), parse_mode="Markdown",
     )
@@ -423,7 +468,7 @@ async def menu_collect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def collect_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.edit_message_text("🔎 Собираю контент во всех каналах… (может занять несколько минут)")
+    await query.edit_message_text("🧠 Генерирую контент во всех каналах… (может занять несколько минут)")
     try:
         status_msg = await query.message.reply_text("⏳ Идёт сбор…")
     except Exception:  # noqa: BLE001
@@ -442,7 +487,7 @@ async def collect_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as e:  # noqa: BLE001
             logger.warning("Сбор %s: %s", ch["channel_id"], e)
             lines.append(f"❌ {ch.get('channel_title') or ch['channel_id']}: {e}")
-    text = "🔎 *Сбор завершён*\n\n" + "\n".join(lines)
+    text = "🧠 *Генерация завершена*\n\n" + "\n".join(lines)
     if status_msg is not None:
         try:
             await status_msg.edit_text(text, parse_mode="Markdown")
@@ -462,7 +507,7 @@ async def menu_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         title = ch.get("channel_title") or ch["channel_id"]
         keyboard.append([InlineKeyboardButton(f"🧠 {title} ({count})", callback_data=f"mem_stats|{ch['channel_id']}")])
     keyboard.append([back_btn()])
-    await query.edit_message_text("🧠 *Память бота*\nКонтент, собранный из интернета.",
+    await query.edit_message_text("🧠 *Память бота*\nКонтент, сгенерированный ИИ.",
                                   reply_markup=kb(keyboard), parse_mode="Markdown")
     await safe_answer(query)
 
@@ -706,7 +751,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(
             f"✅ Канал *{title or cid}* добавлен!\n\n"
             "📝 Теперь открой канал и задай описание (о чём он) — по нему бот "
-            "будет искать контент в интернете." if ok else "❌ Уже есть в базе.",
+            "будет сам вести канал." if ok else "❌ Уже есть в базе.",
             parse_mode="Markdown",
         )
         user_states.pop(user_id, None)
@@ -716,8 +761,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await db.update_channel(extra, channel_description=text)
         await update.message.reply_text(
             "✅ Описание сохранено.\n\n"
-            "Теперь можно нажать «🔎 Собрать инфу сейчас» — ИИ найдёт контент "
-            "в интернете и сохранит в память, а автопостинг будет вести канал.")
+            "Теперь можно нажать «🧠 Сгенерировать контент» — ИИ найдёт контент "
+            "по описанию и сохранит в память, а автопостинг будет вести канал.")
         user_states.pop(user_id, None)
         return
 
@@ -855,6 +900,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await channel_interval(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_gen|"):
         await channel_generate(update, context, data.split("|", 1)[1])
+    elif data.startswith("ch_test|"):
+        await channel_test(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_now|"):
         await channel_generate_now(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_collect|"):

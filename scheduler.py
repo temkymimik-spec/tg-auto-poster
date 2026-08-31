@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import channel_parser as cp
 import database as db
-from ai.analyzer import generate_from_memory
+from ai.analyzer import generate_content_items, generate_from_memory
 from config import AUTOPOST_LOOP_SEC, COPY_DELAY, POSTS_PER_DAY, POST_HOURS, SCHEDULE_TZ
 
 logger = logging.getLogger(__name__)
@@ -117,16 +117,15 @@ async def _run_schedule() -> None:
     if last == key:
         return
 
-    try:
-        cursor = int(await db.get_setting(_CURSOR_KEY, "0"))
-    except ValueError:
-        cursor = 0
-    ch = channels[cursor % len(channels)]
-    cursor = (cursor + 1) % len(channels)
-    await db.set_setting(_CURSOR_KEY, str(cursor))
+    for ch in channels:
+        try:
+            logger.info("Авто-расписание: слот %d, публикую в %s",
+                        hour, ch.get("channel_title") or ch["channel_id"])
+            await auto_post_for(ch)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Ошибка авто-поста в %s: %s", ch["channel_id"], e)
+        await asyncio.sleep(COPY_DELAY)
 
-    logger.info("Авто-расписание: слот %d, публикую в %s", hour, ch.get("channel_title") or ch["channel_id"])
-    await auto_post_for(ch)
     await db.set_setting(_LAST_KEY, key)
 
 
@@ -147,6 +146,16 @@ async def auto_post_for(ch: dict) -> bool:
             media_url = memory[0].get("media_url") or ""
             ok = await _publish(ch_id, result["text"], media=media, media_url=media_url,
                                 provider=result["provider"], model=result["model"])
+            await asyncio.sleep(COPY_DELAY)
+            return ok
+
+    # Если памяти нет — ИИ генерит свежий пост на лету по описанию канала
+    desc = (ch.get("channel_description") or "").strip()
+    if desc:
+        items = await generate_content_items(desc, ch.get("style_prompt", ""))
+        if items:
+            ok = await _publish(ch_id, items[0]["content"],
+                                provider="", model="")
             await asyncio.sleep(COPY_DELAY)
             return ok
 
