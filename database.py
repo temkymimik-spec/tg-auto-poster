@@ -471,13 +471,28 @@ async def save_to_memory(channel_id: str, source_channel_id: str, topic: str, su
                          raw_text: str, source_post_id: int = 0, media_path: str = "") -> int:
     conn = await get_conn()
     async with _write_lock:
-        cur = await conn.execute(
-            "INSERT INTO memory (channel_id, source_channel_id, topic, summary, keywords,"
-            " importance, emotion, raw_text, media_path, source_post_id, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (channel_id, source_channel_id, topic, summary, keywords,
-             importance, emotion, raw_text, media_path, source_post_id, time.time()),
-        )
+        try:
+            cur = await conn.execute(
+                "INSERT INTO memory (channel_id, source_channel_id, topic, summary, keywords,"
+                " importance, emotion, raw_text, media_path, source_post_id, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (channel_id, source_channel_id, topic, summary, keywords,
+                 importance, emotion, raw_text, media_path, source_post_id, time.time()),
+            )
+        except Exception as e:  # noqa: BLE001
+            # Старая БД без колонки media_path — мигрируем и повторяем вставку.
+            if "no column named media_path" in str(e):
+                await _migrate(conn)
+                await conn.commit()
+                cur = await conn.execute(
+                    "INSERT INTO memory (channel_id, source_channel_id, topic, summary, keywords,"
+                    " importance, emotion, raw_text, media_path, source_post_id, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (channel_id, source_channel_id, topic, summary, keywords,
+                     importance, emotion, raw_text, media_path, source_post_id, time.time()),
+                )
+            else:
+                raise
         await conn.commit()
         return cur.lastrowid
 

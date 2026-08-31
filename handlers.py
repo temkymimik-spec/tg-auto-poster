@@ -360,11 +360,13 @@ async def channel_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, ch
         stats = await monitor.analyze_channel(ch, sources, state)
         await asyncio.sleep(0.2)
         err = f"\n⚠️ {stats.get('error')}" if stats.get("error") else ""
-        skipped = stats.get("skipped", 0)
+        ecount = stats.get("errors", 0)
+        rcount = stats.get("skipped", 0)
         await query.edit_message_text(
             f"✅ Анализ завершён.\nНовых постов: {stats.get('new_posts', 0)}\n"
             f"Сохранено в память: {stats.get('saved', 0)}\n"
-            f"Пропущено рекламы: {skipped}{err}",
+            f"Ошибок сохранения: {ecount}\n"
+            f"Ошибок чтения источников: {rcount}{err}",
             reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
         )
     else:
@@ -407,7 +409,8 @@ async def channel_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         f"📥 Заполнение памяти завершено.\n"
         f"Проверено постов: {stats.get('posts_checked', 0)}\n"
         f"Сохранено в память: {stats.get('saved', 0)}\n"
-        f"Пропущено рекламы: {stats.get('skipped', 0)}{err}"
+        f"Ошибок сохранения: {stats.get('errors', 0)}\n"
+        f"Ошибок чтения источников: {stats.get('skipped', 0)}{err}"
     )
     if status_msg is not None:
         try:
@@ -1117,7 +1120,7 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         state = await db.get_monitor_state(ch["channel_id"])
         stats = await monitor.analyze_channel(ch, sources, state)
         title = ch.get("channel_title") or ch["channel_id"]
-        report.append(f"• {title}: новых {stats.get('new_posts', 0)}, в память {stats.get('saved', 0)}, рекламы {stats.get('skipped', 0)}")
+        report.append(f"• {title}: новых {stats.get('new_posts', 0)}, в память {stats.get('saved', 0)}, ошибок {stats.get('errors', 0)}")
     if not report:
         await update.message.reply_text("Нет активных каналов с источниками.")
         return

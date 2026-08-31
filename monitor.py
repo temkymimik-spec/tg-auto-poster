@@ -66,7 +66,7 @@ async def cycle() -> None:
 
 
 def _fresh_stats() -> dict:
-    return {"new_posts": 0, "saved": 0, "analyzed_fail": 0, "skipped": 0}
+    return {"new_posts": 0, "saved": 0, "analyzed_fail": 0, "skipped": 0, "errors": 0}
 
 
 async def _process_post(stats: dict, m, ch: dict, source_ref: str) -> None:
@@ -74,43 +74,50 @@ async def _process_post(stats: dict, m, ch: dict, source_ref: str) -> None:
 
     Фильтров рекламы/мусора нет: любой пост идёт в память, чтобы AI
     мог на нём генерировать контент. Медиа качается всегда, если есть.
+    Один неудачный пост не должен ломать остальные — ошибки считаем в stats["errors"].
     """
     text = (m.text or "").strip()
     media_path = ""
     if getattr(m, "media", None):
-        media_path = await cp.download_media(m) or ""
+        try:
+            media_path = await cp.download_media(m) or ""
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Не удалось скачать медиа поста %s: %s", m.id, e)
+            media_path = ""
 
-    if not text:
-        # Медиа-пост без текста — сохраняем как идею по картинке.
-        await db.save_to_memory(
-            channel_id=ch["channel_id"],
-            source_channel_id=source_ref,
-            topic="Медиа-идея",
-            summary="Медиа-пост без текста (готовая идея по картинке/видео)",
-            keywords="",
-            importance=5,
-            emotion="neutral",
-            raw_text="",
-            source_post_id=m.id,
-            media_path=media_path,
-        )
+    try:
+        if not text:
+            # Медиа-пост без текста — сохраняем как идею по картинке.
+            await db.save_to_memory(
+                channel_id=ch["channel_id"],
+                source_channel_id=source_ref,
+                topic="Медиа-идея",
+                summary="Медиа-пост без текста (готовая идея по картинке/видео)",
+                keywords="",
+                importance=5,
+                emotion="neutral",
+                raw_text="",
+                source_post_id=m.id,
+                media_path=media_path,
+            )
+        else:
+            analysis = await analyze_post(text, "")
+            await db.save_to_memory(
+                channel_id=ch["channel_id"],
+                source_channel_id=source_ref,
+                topic=analysis.get("topic", "") or "Идея",
+                summary=analysis.get("summary", "") or text[:200],
+                keywords=analysis.get("keywords", ""),
+                importance=analysis.get("importance", 5),
+                emotion=analysis.get("emotion", "neutral"),
+                raw_text=text[:3000],
+                source_post_id=m.id,
+                media_path=media_path,
+            )
         stats["saved"] += 1
-        return
-
-    analysis = await analyze_post(text, "")
-    await db.save_to_memory(
-        channel_id=ch["channel_id"],
-        source_channel_id=source_ref,
-        topic=analysis.get("topic", "") or "Идея",
-        summary=analysis.get("summary", "") or text[:200],
-        keywords=analysis.get("keywords", ""),
-        importance=analysis.get("importance", 5),
-        emotion=analysis.get("emotion", "neutral"),
-        raw_text=text[:3000],
-        source_post_id=m.id,
-        media_path=media_path,
-    )
-    stats["saved"] += 1
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Не удалось сохранить пост %s (%s): %s", m.id, source_ref, e)
+        stats["errors"] += 1
 
 
 async def analyze_channel(ch: dict, sources: list[dict], state: dict,
