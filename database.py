@@ -144,11 +144,19 @@ async def init_db() -> None:
 async def _migrate(conn) -> None:
     """Добавляет новые колонки, которых ещё нет в старых БД."""
     try:
-        cols = {r["name"] for r in await conn.execute("PRAGMA table_info(memory)")}
-        if "media_path" not in cols:
-            await conn.execute("ALTER TABLE memory ADD COLUMN media_path TEXT DEFAULT ''")
+        cur = await conn.execute("PRAGMA table_info(memory)")
+        rows = await cur.fetchall()
+        cols = {row[0] for row in rows}
+        if "media_path" in cols:
+            return
+    except Exception:
+        # не смогли прочитать схему — всё равно пробуем добавить колонку ниже
+        pass
+    try:
+        await conn.execute("ALTER TABLE memory ADD COLUMN media_path TEXT DEFAULT ''")
     except Exception as e:  # noqa: BLE001
-        logger.warning("Миграция memory.media_path не удалась: %s", e)
+        if "duplicate column" not in str(e).lower():
+            logger.warning("Миграция memory.media_path не удалась: %s", e)
 
 
 async def _seed_ai_keys() -> None:
