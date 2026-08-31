@@ -169,10 +169,11 @@ async def channel_open(update: Update, context: ContextTypes.DEFAULT_TYPE, chann
         [InlineKeyboardButton("🔄 Сгенерировать пост из памяти", callback_data=f"ch_gen|{channel_id}")],
         [InlineKeyboardButton("🧪 Тест поста (не публикует)", callback_data=f"ch_test|{channel_id}")],
         [InlineKeyboardButton("⚡ Выложить сейчас", callback_data=f"ch_now|{channel_id}")],
-        [InlineKeyboardButton("🧠 Сгенерировать контент", callback_data=f"ch_collect|{channel_id}")],
+        [InlineKeyboardButton("🚀 Тест-пост в канал", callback_data=f"ch_quick_test|{channel_id}")],
         [InlineKeyboardButton("📥 Черновики", callback_data=f"ch_posts|{channel_id}")],
         [InlineKeyboardButton("🧠 Память", callback_data=f"mem_stats|{channel_id}")],
         [InlineKeyboardButton("📢 Реклама", callback_data=f"ch_ads|{channel_id}")],
+        [InlineKeyboardButton("🔍 Проверить канал", callback_data=f"ch_validate|{channel_id}")],
         [InlineKeyboardButton("❌ Удалить", callback_data=f"ch_del|{channel_id}")],
         [back_btn("menu_channels")],
     ]
@@ -328,6 +329,64 @@ async def channel_generate_now(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         "✅ Готово." if ok else "❌ Не удалось опубликовать.",
         reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
+    )
+    await safe_answer(query)
+
+
+async def channel_quick_test(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
+    """Мгновенно шлёт тестовый сообщение в канал (без AI, для проверки связи)."""
+    query = update.callback_query
+    ch = await db.get_channel(channel_id)
+    if not ch:
+        await query.edit_message_text("Канал не найден.", reply_markup=kb([[back_btn("menu_channels")]]))
+        await safe_answer(query)
+        return
+    title = ch.get("channel_title") or channel_id
+    try:
+        await query.edit_message_text(f"🚀 Отправляю тест-пост в «{title}»…")
+    except Exception:
+        pass
+    test_text = (
+        "🧪 *Тестовый пост*\n\n"
+        "Бот работает. Если вы видите это сообщение — всё ок.\n"
+        f"`{channel_id}`"
+    )
+    ok = await cp.send_post(channel_id, test_text)
+    if ok:
+        await query.edit_message_text(
+            f"✅ Тест-пост доставлен в «{title}»!",
+            reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
+        )
+    else:
+        await query.edit_message_text(
+            f"❌ Не удалось доставить в «{title}».\n\n"
+            "Проверь:\n"
+            "• Бот добавлен в канал как администратор?\n"
+            "• Права на публикацию постов включены?\n"
+            f"• Username/ID канала корректен: `{channel_id}`",
+            reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
+            parse_mode="Markdown",
+        )
+    await safe_answer(query)
+
+
+async def channel_validate(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
+    """Проверяет доступ бота к каналу и показывает результат."""
+    query = update.callback_query
+    ch = await db.get_channel(channel_id)
+    if not ch:
+        await query.edit_message_text("Канал не найден.", reply_markup=kb([[back_btn("menu_channels")]]))
+        await safe_answer(query)
+        return
+    try:
+        await query.edit_message_text("🔍 Проверяю канал…")
+    except Exception:
+        pass
+    valid, info = await cp.validate_channel(channel_id)
+    await query.edit_message_text(
+        f"*{ch.get('channel_title') or channel_id}*\nID: `{channel_id}`\n\n{info}",
+        reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
+        parse_mode="Markdown",
     )
     await safe_answer(query)
 
@@ -748,12 +807,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "(без полной ссылки). Бот должен быть админом канала.")
             return
         ok = await db.add_channel(cid, title, "", interval=60)
-        await update.message.reply_text(
-            f"✅ Канал *{title or cid}* добавлен!\n\n"
-            "📝 Теперь открой канал и задай описание (о чём он) — по нему бот "
-            "будет сам вести канал." if ok else "❌ Уже есть в базе.",
-            parse_mode="Markdown",
-        )
+        if ok:
+            valid, info = await cp.validate_channel(cid)
+            await update.message.reply_text(
+                f"✅ Канал *{title or cid}* добавлен!\n\n{info}\n\n"
+                "📝 Теперь открой канал и задай описание (о чём он) — по нему бот "
+                "будет сам вести канал.",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text("❌ Уже есть в базе.")
         user_states.pop(user_id, None)
         return
 
@@ -904,6 +967,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await channel_test(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_now|"):
         await channel_generate_now(update, context, data.split("|", 1)[1])
+    elif data.startswith("ch_quick_test|"):
+        await channel_quick_test(update, context, data.split("|", 1)[1])
+    elif data.startswith("ch_validate|"):
+        await channel_validate(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_collect|"):
         await channel_collect(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_posts|"):
