@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS memory (
     importance INTEGER DEFAULT 5,
     emotion TEXT DEFAULT 'neutral',
     raw_text TEXT DEFAULT '',
+    media_path TEXT DEFAULT '',
     source_post_id INTEGER DEFAULT 0,
     created_at REAL DEFAULT 0
 );
@@ -134,8 +135,20 @@ async def init_db() -> None:
     conn = await get_conn()
     async with _write_lock:
         await conn.executescript(SCHEMA)
+        # мягкая миграция: добавляем недостающие колонки в уже существующие таблицы
+        await _migrate(conn)
         await conn.commit()
     await _seed_ai_keys()
+
+
+async def _migrate(conn) -> None:
+    """Добавляет новые колонки, которых ещё нет в старых БД."""
+    try:
+        cols = {r["name"] for r in await conn.execute("PRAGMA table_info(memory)")}
+        if "media_path" not in cols:
+            await conn.execute("ALTER TABLE memory ADD COLUMN media_path TEXT DEFAULT ''")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Миграция memory.media_path не удалась: %s", e)
 
 
 async def _seed_ai_keys() -> None:
@@ -455,15 +468,15 @@ async def ai_key_failed(provider: str, api_key: str, max_fails: int) -> None:
 # -------------------------------------------------------------------- память
 async def save_to_memory(channel_id: str, source_channel_id: str, topic: str, summary: str,
                          keywords: str, importance: int, emotion: str,
-                         raw_text: str, source_post_id: int = 0) -> int:
+                         raw_text: str, source_post_id: int = 0, media_path: str = "") -> int:
     conn = await get_conn()
     async with _write_lock:
         cur = await conn.execute(
             "INSERT INTO memory (channel_id, source_channel_id, topic, summary, keywords,"
-            " importance, emotion, raw_text, source_post_id, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " importance, emotion, raw_text, media_path, source_post_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (channel_id, source_channel_id, topic, summary, keywords,
-             importance, emotion, raw_text, source_post_id, time.time()),
+             importance, emotion, raw_text, media_path, source_post_id, time.time()),
         )
         await conn.commit()
         return cur.lastrowid
