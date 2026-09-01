@@ -1,12 +1,13 @@
-"""Мониторинг каналов-конкурентов: читает новые посты и складывает в память."""
+"""Наполнение памяти каналов контентом: AI сам генерит посты по описанию канала + дата.
+
+Без интернета — модель использует свои знания, привязываясь к сегодняшней дате.
+"""
 import asyncio
 import logging
 
-import channel_parser as cp
 import database as db
-from ai.analyzer import analyze_post
-from config import FETCH_POST_DELAY, IMPORTANCE_MIN, MONITOR_INTERVAL_SEC, MONITOR_LOOKBACK
-from session_manager import get_client
+from ai.analyzer import generate_content_items
+from config import MONITOR_INTERVAL_SEC
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ async def _loop() -> None:
         try:
             await cycle()
         except Exception as e:  # noqa: BLE001
-            logger.exception("Ошибка цикла мониторинга: %s", e)
+            logger.exception("Ошибка цикла наполнения памяти: %s", e)
         try:
             await asyncio.wait_for(_run_flag.wait(), timeout=MONITOR_INTERVAL_SEC)
         except asyncio.TimeoutError:
@@ -50,71 +51,57 @@ async def _loop() -> None:
 
 
 async def cycle() -> None:
-    if await get_client() is None:
-        return  # аккаунт не подключён — мониторить нечем
+    """Периодически добирает контент в память для каналов с описанием."""
     channels = await db.get_channels(active_only=True)
     for ch in channels:
-        sources = await db.get_source_channels(ch["channel_id"])
-        if not sources:
+        desc = (ch.get("channel_description") or "").strip()
+        if not desc:
             continue
-        await analyze_channel(ch, sources)
-
-
-async def analyze_channel(ch: dict, sources: list[dict], state: dict | None = None,
-                          lookback: int | None = None) -> dict:
-    """Анализирует новые посты по источникам канала. Возвращает статистику прогона.
-
-    Курсор (last_post_id) ведётся отдельно для каждого источника, чтобы каналы
-    с разными диапазонами ID не блокировали друг друга.
-    """
-    lookback = lookback or MONITOR_LOOKBACK
-    client = await get_client()
-    if client is None:
-        return {"error": "аккаунт не подключён"}
-
-    stats = {"new_posts": 0, "saved": 0, "analyzed_fail": 0, "skipped": 0}
-
-    for source in sources:
-        source_ref = source["source_channel_id"]
-        st = await db.get_monitor_state(ch["channel_id"], source_channel_id=source_ref)
-        last_id = st.get("last_post_id", 0)
-        new_last = last_id
-
+        state = await db.get_web_collect_state(ch["channel_id"])
+        interval = max(int(ch.get("post_interval_min") or 60), 1) * 60
+        now = time.time()
+        if now - float(state.get("last_collect_time") or 0) < interval:
+            continue
         try:
-            async for m in cp.iter_new_posts(source_ref, after_id=last_id, limit=lookback):
-                if m.id <= last_id:
-                    continue
-                stats["new_posts"] += 1
-                new_last = max(new_last, m.id)
-
-                analysis = await analyze_post(m.text, source.get("source_channel_title", ""))
-                importance = analysis.get("importance", 1)
-                if analysis.get("analyze_failed"):
-                    # AI-анализ не удался — считаем фейл, но курсор не блокируем
-                    stats["analyzed_fail"] += 1
-                elif importance >= IMPORTANCE_MIN:
-                    await db.save_to_memory(
-                        channel_id=ch["channel_id"],
-                        source_channel_id=source_ref,
-                        topic=analysis.get("topic", ""),
-                        summary=analysis.get("summary", ""),
-                        keywords=analysis.get("keywords", ""),
-                        importance=importance,
-                        emotion=analysis.get("emotion", "neutral"),
-                        raw_text=m.text[:3000],
-                        source_post_id=m.id,
-                    )
-                    stats["saved"] += 1
-                else:
-                    stats["skipped"] += 1
-
-                await asyncio.sleep(FETCH_POST_DELAY)
+            await collect_for_channel(ch)
+            await db.update_web_collect_state(ch["channel_id"])
         except Exception as e:  # noqa: BLE001
-            logger.warning("Ошибка мониторинга источника %s: %s", source_ref, e)
+            logger.warning("Наполнение канала %s: %s", ch["channel_id"], e)
 
-        # курсор всегда продвигаем — иначе сбойный пост блокирует источник навсегда
-        if new_last > last_id:
-            await db.update_monitor_state(ch["channel_id"], new_last, source_channel_id=source_ref)
 
-    logger.info("Мониторинг %s: %s", ch.get("channel_title", ch["channel_id"]), stats)
+async def collect_for_channel(ch: dict) -> dict:
+    """Генерирует готовые посты для канала и сохраняет в память."""
+    desc = (ch.get("channel_description") or "").strip()
+    stats = {"generated": 0, "saved": 0, "errors": 0}
+    if not desc:
+        return stats
+
+    items = await generate_content_items(desc, ch.get("style_prompt", ""))
+    stats["generated"] = len(items)
+
+    for it in items:
+        try:
+            await db.save_to_memory(
+                channel_id=ch["channel_id"],
+                source_url="",
+                topic=it["topic"] or "Идея",
+                summary=it["content"][:500],
+                keywords="",
+                importance=7,
+                emotion="neutral",
+                raw_text=it["content"],
+                media_path="",
+                media_url="",
+            )
+            stats["saved"] += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Ошибка сохранения сгенерированного поста: %s", e)
+            stats["errors"] += 1
+
+    logger.info("Наполнение %s: %s", ch.get("channel_title", ch["channel_id"]), stats)
     return stats
+
+
+async def manual_collect(ch: dict) -> dict:
+    """Ручной запуск генерации контента для канала."""
+    return await collect_for_channel(ch)
