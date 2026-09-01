@@ -20,6 +20,32 @@ def get_bot() -> Bot | None:
     return _bot
 
 
+import re
+
+
+def clean_post_text(text: str) -> str:
+    """Убирает markdown-разметку из поста, чтобы в канал не уходили '*', '-', '_' и т.д."""
+    if not text:
+        return text
+    t = text
+    # ссылки [text](url) -> text
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+    # жирный/курсив/код: **x**, __x__, *x*, _x_, `x`
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)
+    t = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", t)
+    t = re.sub(r"__(.+?)__", r"\1", t)
+    t = re.sub(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", r"\1", t)
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    # маркированные списки из дефиса/звёздочки в начале строк
+    t = re.sub(r"(?m)^[ \t]*[-*]\s+", "", t)
+    # значки > (цитаты) и # заголовки в начале строк
+    t = re.sub(r"(?m)^[ \t]*#{1,6}\s*", "", t)
+    t = re.sub(r"(?m)^[ \t]*>\s?", "", t)
+    # сжатие трёх и более подряд идущих пустых строк
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t
+
+
 def _resolve_chat_id(channel_id: str):
     """Приводит channel_id к формату, понятному Bot API.
 
@@ -45,6 +71,7 @@ async def send_post(channel_id: str, text: str, media_path: str | None = None,
         logger.error("Bot не инициализирован")
         return False
     try:
+        text = clean_post_text(text)
         cid = _resolve_chat_id(channel_id)
         if media_path and os.path.isfile(media_path):
             with open(media_path, "rb") as f:

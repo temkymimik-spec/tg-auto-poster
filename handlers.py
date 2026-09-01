@@ -1,4 +1,5 @@
 """Telegram-интерфейс бота: меню, команды, диалоговые состояния."""
+import html
 import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -45,6 +46,11 @@ async def deny(update: Update) -> None:
 def short(text: str, n: int = 40) -> str:
     text = (text or "").replace("\n", " ")
     return text[:n] + "…" if len(text) > n else text
+
+
+def esc(text: str) -> str:
+    """Экранирует текст для HTML parse_mode, чтобы спецсимволы (*, _, &, <) не ломали разметку."""
+    return html.escape(str(text or ""), quote=False)
 
 
 async def safe_answer(query) -> None:
@@ -177,7 +183,15 @@ async def channel_open(update: Update, context: ContextTypes.DEFAULT_TYPE, chann
         [InlineKeyboardButton("❌ Удалить", callback_data=f"ch_del|{channel_id}")],
         [back_btn("menu_channels")],
     ]
-    await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
+    await query.edit_message_text(
+        f"<b>{esc(ch.get('channel_title') or channel_id)}</b>\n"
+        f"ID: <code>{esc(channel_id)}</code>\n"
+        f"Статус: {status}\n"
+        f"Интервал: {ch.get('post_interval_min') or 60} мин\n"
+        f"📝 Описание: {esc(short(desc, 80))}\n"
+        f"🎨 Стиль: {esc(short(ch.get('style_prompt') or 'не задан', 60))}",
+        reply_markup=kb(keyboard), parse_mode="HTML",
+    )
     await safe_answer(query)
 
 
@@ -259,8 +273,8 @@ async def channel_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         [back_btn(f"ch_open|{channel_id}")],
     ]
     await query.edit_message_text(
-        f"🤖 *Пост* `{result['provider']}/{result['model']}`\n\n---\n{result['text'][:1500]}\n---",
-        reply_markup=kb(keyboard), parse_mode="Markdown",
+        f"🤖 <b>Пост</b> <code>{esc(result['provider'])}/{esc(result['model'])}</code>\n\n---\n{esc(result['text'][:1500])}\n---",
+        reply_markup=kb(keyboard), parse_mode="HTML",
     )
     await safe_answer(query)
 
@@ -298,14 +312,14 @@ async def channel_test(update: Update, context: ContextTypes.DEFAULT_TYPE, chann
         await safe_answer(query)
         return
 
-    text = f"🧪 *Тестовый пост* (не опубликован)\n\n---\n{result['text'][:1500]}\n---"
+    text = f"🧪 <b>Тестовый пост</b> (не опубликован)\n\n---\n{esc(result['text'][:1500])}\n---"
     if status_msg is not None:
         try:
-            await status_msg.edit_text(text, parse_mode="Markdown")
+            await status_msg.edit_text(text, parse_mode="HTML")
         except Exception:  # noqa: BLE001
             pass
     await query.edit_message_text(text, reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
-                                  parse_mode="Markdown")
+                                  parse_mode="HTML")
     await safe_answer(query)
 
 
@@ -347,9 +361,9 @@ async def channel_quick_test(update: Update, context: ContextTypes.DEFAULT_TYPE,
     except Exception:
         pass
     test_text = (
-        "🧪 *Тестовый пост*\n\n"
+        "🧪 Тестовый пост\n\n"
         "Бот работает. Если вы видите это сообщение — всё ок.\n"
-        f"`{channel_id}`"
+        f"{channel_id}"
     )
     ok = await cp.send_post(channel_id, test_text)
     if ok:
@@ -359,13 +373,13 @@ async def channel_quick_test(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
     else:
         await query.edit_message_text(
-            f"❌ Не удалось доставить в «{title}».\n\n"
+            f"❌ Не удалось доставить в «{esc(title)}».\n\n"
             "Проверь:\n"
             "• Бот добавлен в канал как администратор?\n"
             "• Права на публикацию постов включены?\n"
-            f"• Username/ID канала корректен: `{channel_id}`",
+            f"• Username/ID канала корректен: <code>{esc(channel_id)}</code>",
             reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
     await safe_answer(query)
 
@@ -384,9 +398,9 @@ async def channel_validate(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         pass
     valid, info = await cp.validate_channel(channel_id)
     await query.edit_message_text(
-        f"*{ch.get('channel_title') or channel_id}*\nID: `{channel_id}`\n\n{info}",
+        f"<b>{esc(ch.get('channel_title') or channel_id)}</b>\nID: <code>{esc(channel_id)}</code>\n\n{esc(info)}",
         reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
     await safe_answer(query)
 
@@ -535,24 +549,25 @@ async def collect_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     channels = await db.get_channels(active_only=True)
     lines = []
     for ch in channels:
+        name = esc(ch.get('channel_title') or ch['channel_id'])
         desc = (ch.get("channel_description") or "").strip()
         if not desc:
-            lines.append(f"— {ch.get('channel_title') or ch['channel_id']}: нет описания, пропущен")
+            lines.append(f"— {name}: нет описания, пропущен")
             continue
         try:
             stats = await monitor.manual_collect(ch)
             await db.update_web_collect_state(ch["channel_id"])
-            lines.append(f"✅ {ch.get('channel_title') or ch['channel_id']}: +{stats.get('saved', 0)}")
+            lines.append(f"✅ {name}: +{stats.get('saved', 0)}")
         except Exception as e:  # noqa: BLE001
             logger.warning("Сбор %s: %s", ch["channel_id"], e)
-            lines.append(f"❌ {ch.get('channel_title') or ch['channel_id']}: {e}")
-    text = "🧠 *Генерация завершена*\n\n" + "\n".join(lines)
+            lines.append(f"❌ {name}: {esc(e)}")
+    text = "🧠 <b>Генерация завершена</b>\n\n" + "\n".join(lines)
     if status_msg is not None:
         try:
-            await status_msg.edit_text(text, parse_mode="Markdown")
+            await status_msg.edit_text(text, parse_mode="HTML")
         except Exception:  # noqa: BLE001
             pass
-    await query.edit_message_text(text, reply_markup=kb([[back_btn("menu_collect")]]), parse_mode="Markdown")
+    await query.edit_message_text(text, reply_markup=kb([[back_btn("menu_collect")]]), parse_mode="HTML")
     await safe_answer(query)
 
 
@@ -582,9 +597,9 @@ async def mem_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_
     topics_text = "\n".join(f"  • {t} ({c})" for t, c in list(topics.items())[:5]) or "  нет данных"
     title = ch.get("channel_title", channel_id) if ch else channel_id
     text = (
-        f"*🧠 Память: {title}*\n"
+        f"<b>🧠 Память: {esc(title)}</b>\n"
         f"Записей: {total}\n\n"
-        f"*Топ тем:*\n{topics_text}"
+        f"<b>Топ тем:</b>\n{esc(topics_text)}"
     )
     keyboard = [
         [InlineKeyboardButton("📋 Записи", callback_data=f"mem_list|{channel_id}")],
@@ -593,21 +608,21 @@ async def mem_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_
         [InlineKeyboardButton("📝 По теме", callback_data=f"mem_topic|{channel_id}")],
         [back_btn(f"ch_open|{channel_id}")],
     ]
-    await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
+    await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="HTML")
     await safe_answer(query)
 
 
 async def mem_list(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
     query = update.callback_query
     memory = await db.get_memory(channel_id, limit=10)
-    text = f"*📋 Записи ({len(memory)}):*\n\n"
+    text = f"<b>📋 Записи ({len(memory)}):</b>\n\n"
     for m in memory:
         imp = "🔴" if m["importance"] >= 8 else "🟡" if m["importance"] >= 5 else "⚪"
-        text += f"{imp} *{m['topic']}* ({m['importance']})\n{short(m['summary'], 90)}\n\n"
+        text += f"{imp} <b>{esc(m['topic'])}</b> ({m['importance']})\n{esc(short(m['summary'], 90))}\n\n"
     if not memory:
         text = "Пока нет записей."
     keyboard = [[back_btn(f"mem_stats|{channel_id}")]]
-    await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
+    await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="HTML")
     await safe_answer(query)
 
 
@@ -633,8 +648,9 @@ async def mem_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, chann
             [InlineKeyboardButton("📤 Опубликовать", callback_data=f"post_pub|{post_id}")],
             [back_btn(f"mem_stats|{channel_id}")],
         ]
-        await query.edit_message_text(f"🤖 {result['text'][:1500]}\n`{result['provider']}/{result['model']}`",
-                                      reply_markup=kb(keyboard), parse_mode="Markdown")
+        await query.edit_message_text(
+            f"🤖 {esc(result['text'][:1500])}\n<code>{esc(result['provider'])}/{esc(result['model'])}</code>",
+            reply_markup=kb(keyboard), parse_mode="HTML")
     else:
         await query.edit_message_text(f"❌ {result.get('error', 'Ошибка')}",
                                       reply_markup=kb([[back_btn(f"mem_stats|{channel_id}")]]))
@@ -810,10 +826,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if ok:
             valid, info = await cp.validate_channel(cid)
             await update.message.reply_text(
-                f"✅ Канал *{title or cid}* добавлен!\n\n{info}\n\n"
+                f"✅ Канал <b>{esc(title or cid)}</b> добавлен!\n\n{esc(info)}\n\n"
                 "📝 Теперь открой канал и задай описание (о чём он) — по нему бот "
-                "будет сам вести канал.",
-                parse_mode="Markdown",
+                "сам будет вести канал.",
+                parse_mode="HTML",
             )
         else:
             await update.message.reply_text("❌ Уже есть в базе.")
@@ -871,13 +887,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "memory_search" and extra:
         results = await db.search_memory(extra, text)
         if results:
-            msg = f"🔍 *«{text}»* ({len(results)})\n\n"
+            msg = f"🔍 <b>«{esc(text)}»</b> ({len(results)})\n\n"
             for m in results[:5]:
                 imp = "🔴" if m["importance"] >= 8 else "🟡" if m["importance"] >= 5 else "⚪"
-                msg += f"{imp} *{m['topic']}* ({m['importance']})\n{short(m['summary'], 90)}\n\n"
+                msg += f"{imp} <b>{esc(m['topic'])}</b> ({m['importance']})\n{esc(short(m['summary'], 90))}\n\n"
         else:
             msg = "Ничего не найдено."
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(msg, parse_mode="HTML")
         user_states.pop(user_id, None)
         return
 
