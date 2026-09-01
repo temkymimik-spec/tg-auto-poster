@@ -1,58 +1,113 @@
-"""Отправка постов в каналы через Telegram Bot API (без Telethon)."""
+"""Работа с каналами через аккаунт (Telethon): резолв, чтение, отправка."""
 import logging
-import os
 
-from telegram import Bot
+from telethon.tl.types import Channel
 
-from config import MEDIA_DIR
+from session_manager import get_client
 
 logger = logging.getLogger(__name__)
 
-_bot: Bot | None = None
+TIME_BETWEEN_SENDS = 1.5
+
+# кэш сущностей, чтобы не дёргать сервер Telethon на каждый вызов
+_entity_cache: dict[str, object] = {}
 
 
-def set_bot(bot: Bot) -> None:
-    global _bot
-    _bot = bot
+def normalize_ref(raw: str) -> str:
+    """Приводит ссылку/username/id к виду, который Telethon поймёт."""
+    ref = raw.strip()
+    if ref.startswith("https://t.me/"):
+        ref = "@" + ref[len("https://t.me/") :]
+    elif ref.startswith("t.me/"):
+        ref = "@" + ref[len("t.me/") :]
+    elif ref.startswith("https://") or ref.startswith("http://"):
+        return ref  # пусть Telethon решает по ссылке
+    return ref.split("?")[0]
 
 
-def get_bot() -> Bot | None:
-    return _bot
+async def _get_entity(client, identifier: str):
+    """Возвращает сущность канала, используя кэш по нормализованной ссылке."""
+    key = normalize_ref(identifier)
+    cached = _entity_cache.get(key)
+    if cached is not None:
+        return cached
+    entity = await client.get_entity(key)
+    _entity_cache[key] = entity
+    return entity
 
 
-def _resolve_chat_id(channel_id: str):
-    """Приводит channel_id к формату, понятному Bot API.
+async def resolve_channel(identifier: str) -> dict | None:
+    """Резолвит канал в {id, title, username}. Требует подключённый аккаунт."""
+    client = await get_client()
+    if client is None:
+        return None
+    try:
+        entity = await client.get_entity(normalize_ref(identifier))
+        if isinstance(entity, Channel):
+            _entity_cache[normalize_ref(identifier)] = entity
+            return {
+                "id": str(entity.id),
+                "title": entity.title,
+                "username": entity.username or "",
+            }
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось зарезолвить %s: %s", identifier, e)
+        return None
 
-    Числовые ID (например -1001234567890) передаются как int.
-    Строковые username (например 'mychannel') дополняются @ -> '@mychannel'.
-    Уже начинающиеся на @ оставляем как есть.
-    """
-    cid = channel_id.strip()
-    if cid.lstrip("-").isdigit():
-        return int(cid)
-    if not cid.startswith("@"):
-        return f"@{cid}"
-    return cid
+
+async def fetch_recent_posts(identifier: str, limit: int = 5) -> list[dict]:
+    """Последние посты канала. Только текстовые, с датой и наличием медиа."""
+    client = await get_client()
+    if client is None:
+        return []
+    try:
+        entity = await _get_entity(client, identifier)
+        posts = []
+        async for m in client.iter_messages(entity, limit=limit):
+            text = (m.text or "").strip()
+            if not text:
+                continue
+            posts.append({
+                "id": m.id,
+                "text": text,
+                "date": m.date.isoformat() if m.date else "",
+                "has_media": bool(m.media),
+            })
+        return posts
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Не удалось прочитать посты %s: %s", identifier, e)
+        return []
 
 
-async def send_post(channel_id: str, text: str, media_path: str | None = None,
-                    media_url: str | None = None) -> bool:
-    """Отправляет пост в канал через Bot API.
+async def iter_new_posts(identifier: str, after_id: int, limit: int = 10):
+    """Генератор новых постов после after_id (сверху вниз по дате)."""
+    client = await get_client()
+    if client is None:
+        return
+    try:
+        entity = await _get_entity(client, identifier)
+        async for m in client.iter_messages(entity, limit=limit):
+            if m.id <= after_id:
+                return
+            if m.text and m.text.strip():
+                yield m
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Ошибка чтения %s: %s", identifier, e)
+        return
 
-    Бот должен быть администратором канала.
-    """
-    if _bot is None:
-        logger.error("Bot не инициализирован")
+
+async def send_post(channel_id: str, text: str, media_path: str | None = None) -> bool:
+    """Отправляет пост в канал через аккаунт."""
+    client = await get_client()
+    if client is None:
         return False
     try:
-        cid = _resolve_chat_id(channel_id)
-        if media_path and os.path.isfile(media_path):
-            with open(media_path, "rb") as f:
-                await _bot.send_photo(chat_id=cid, photo=f, caption=text or None)
-        elif media_url:
-            await _bot.send_photo(chat_id=cid, photo=media_url, caption=text or None)
+        entity = await client.get_entity(int(channel_id) if str(channel_id).lstrip("-").isdigit() else channel_id)
+        if media_path:
+            await client.send_file(entity, media_path, caption=text or None)
         else:
-            await _bot.send_message(chat_id=cid, text=text)
+            await client.send_message(entity, text)
         logger.info("Пост отправлен в %s", channel_id)
         return True
     except Exception as e:  # noqa: BLE001
@@ -60,34 +115,21 @@ async def send_post(channel_id: str, text: str, media_path: str | None = None,
         return False
 
 
-async def send_document(channel_id: str, file_path: str, caption: str = "") -> bool:
-    """Отправляет файл в канал."""
-    if _bot is None:
-        return False
+async def get_my_channels() -> list[dict]:
+    """Список каналов, где аккаунт состоит/админит."""
+    client = await get_client()
+    if client is None:
+        return []
     try:
-        cid = _resolve_chat_id(channel_id)
-        with open(file_path, "rb") as f:
-            await _bot.send_document(chat_id=cid, document=f, caption=caption or None)
-        return True
+        out = []
+        async for d in client.iter_dialogs():
+            if d.is_channel:
+                out.append({
+                    "id": str(d.entity.id),
+                    "title": d.name,
+                    "username": d.entity.username or "",
+                })
+        return out
     except Exception as e:  # noqa: BLE001
-        logger.error("Не удалось отправить документ в %s: %s", channel_id, e)
-        return False
-
-
-async def validate_channel(channel_id: str) -> tuple[bool, str]:
-    """Проверяет доступ бота к каналу. Возвращает (ok, info)."""
-    if _bot is None:
-        return False, "Bot не инициализирован"
-    try:
-        cid = _resolve_chat_id(channel_id)
-        chat = await _bot.get_chat(cid)
-        member = await _bot.get_chat_member(cid, (await _bot.get_me()).id)
-        can_post = getattr(member, "can_post_messages", None)
-        title = chat.title or chat.username or str(channel_id)
-        if member.status in ("administrator", "creator") and can_post:
-            return True, f"✅ {title} — бот админ, постинг разрешён"
-        if member.status in ("administrator", "creator"):
-            return True, f"⚠️ {title} — бот админ, но без права постинга"
-        return False, f"❌ {title} — бот не админ (статус: {member.status})"
-    except Exception as e:
-        return False, f"❌ Ошибка: {e}"
+        logger.warning("Не удалось получить каналы: %s", e)
+        return []

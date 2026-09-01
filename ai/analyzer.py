@@ -1,71 +1,23 @@
 """AI-анализ постов и генерация контента."""
 import logging
-from datetime import datetime
 
 from ai import providers
 from ai.prompts import (
     ANALYZE_SYSTEM,
-    CONTENT_SYSTEM,
+    COPYWRITER_SYSTEM,
     MEMORY_WRITER_SYSTEM,
     analyze_prompt,
-    content_prompt,
+    copywrite_prompt,
     memory_prompt,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _season(month: int) -> str:
-    if month in (12, 1, 2):
-        return "зима"
-    if month in (3, 4, 5):
-        return "весна"
-    if month in (6, 7, 8):
-        return "лето"
-    return "осень"
-
-
-async def generate_content_items(channel_desc: str, style_prompt: str = "") -> list[dict]:
-    """AI сам генерит готовые посты по описанию канала + текущая дата.
-
-    Возвращает [{topic, content}]. Без интернета, только знания модели.
-    """
-    desc = (channel_desc or "").strip()
-    if not desc:
-        return []
-    today = datetime.now()
-    _m = today.month
-    _months = ("январе", "феврале", "марте", "апреле", "мае", "июне",
-               "июле", "августе", "сентябре", "октябре", "ноябре", "декабре")
-    month_name = _months[_m - 1]
-    season = _season(_m)
-    system = CONTENT_SYSTEM.format(
-        today=today.strftime("%d.%m.%Y"),
-        month=month_name,
-        season=season,
-    )
-    user = content_prompt(desc, style_prompt)
-    try:
-        data = await providers.parse_json_ai(system, user, temperature=0.8, max_tokens=4000)
-        items = data.get("items") or []
-        if not isinstance(items, list):
-            return []
-        out = []
-        for it in items:
-            if isinstance(it, dict) and it.get("content"):
-                out.append({
-                    "topic": str(it.get("topic", ""))[:150],
-                    "content": str(it["content"]).strip(),
-                })
-        return out
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Не удалось сгенерировать контент: %s", e)
-        return []
-
-
-def _default_result() -> dict:
+def _default_result(analyze_failed: bool = False) -> dict:
     return {"topic": "", "summary": "", "keywords": "",
-            "importance": 1, "emotion": "neutral"}
+            "importance": 0 if analyze_failed else 1, "emotion": "neutral",
+            "analyze_failed": analyze_failed}
 
 
 async def analyze_post(post_text: str, channel_context: str = "") -> dict:
@@ -90,13 +42,14 @@ async def analyze_post(post_text: str, channel_context: str = "") -> dict:
             "keywords": str(data.get("keywords", ""))[:300],
             "importance": importance,
             "emotion": emotion,
+            "analyze_failed": False,
         }
     except providers.AIError as e:
         logger.warning("Не удалось проанализировать пост: %s", e)
-        return _default_result()
+        return _default_result(analyze_failed=True)
     except Exception as e:  # noqa: BLE001
         logger.exception("Ошибка анализа поста: %s", e)
-        return _default_result()
+        return _default_result(analyze_failed=True)
 
 
 async def generate_from_text(source_text: str, style_prompt: str = "",

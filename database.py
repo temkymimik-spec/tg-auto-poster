@@ -1,4 +1,7 @@
-"""Единый доступ к SQLite: один постоянный коннект (WAL) + все таблицы."""
+"""Единый доступ к SQLite: один постоянный коннект (WAL) + все таблицы.
+
+Таблицы и память мониторинга объединены сюда же — так нет дублирующих модулей.
+"""
 import asyncio
 import logging
 import time
@@ -11,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 _conn: aiosqlite.Connection | None = None
 _write_lock = asyncio.Lock()
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS channels (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,10 +22,18 @@ CREATE TABLE IF NOT EXISTS channels (
     channel_username TEXT DEFAULT '',
     is_active INTEGER DEFAULT 1,
     style_prompt TEXT DEFAULT '',
-    channel_description TEXT DEFAULT '',
+    custom_instruction TEXT DEFAULT '',
     post_interval_min INTEGER DEFAULT 60,
     last_post_time REAL DEFAULT 0,
     created_at REAL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS source_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL,
+    source_channel_id TEXT NOT NULL,
+    source_channel_title TEXT DEFAULT '',
+    UNIQUE(channel_id, source_channel_id)
 );
 
 CREATE TABLE IF NOT EXISTS posts (
@@ -31,7 +41,8 @@ CREATE TABLE IF NOT EXISTS posts (
     channel_id TEXT NOT NULL,
     post_text TEXT DEFAULT '',
     post_media_path TEXT DEFAULT '',
-    post_media_url TEXT DEFAULT '',
+    source_channel_id TEXT DEFAULT '',
+    source_post_id INTEGER DEFAULT 0,
     status TEXT DEFAULT 'draft',
     scheduled_time REAL DEFAULT 0,
     published_time REAL DEFAULT 0,
@@ -71,27 +82,39 @@ CREATE TABLE IF NOT EXISTS ai_keys (
 CREATE TABLE IF NOT EXISTS memory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_id TEXT NOT NULL,
-    source_url TEXT DEFAULT '',
+    source_channel_id TEXT DEFAULT '',
     topic TEXT DEFAULT '',
     summary TEXT DEFAULT '',
     keywords TEXT DEFAULT '',
     importance INTEGER DEFAULT 5,
     emotion TEXT DEFAULT 'neutral',
     raw_text TEXT DEFAULT '',
-    media_path TEXT DEFAULT '',
-    media_url TEXT DEFAULT '',
-    created_at REAL DEFAULT 0
+    source_post_id INTEGER DEFAULT 0,
+    created_at REAL DEFAULT 0,
+    UNIQUE(channel_id, source_channel_id, source_post_id)
 );
 
-CREATE TABLE IF NOT EXISTS web_collect_state (
+CREATE TABLE IF NOT EXISTS monitor_state (
     channel_id TEXT PRIMARY KEY,
-    last_collect_time REAL DEFAULT 0
+    last_post_id INTEGER DEFAULT 0,
+    last_check_time REAL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL,
+    posts_count INTEGER DEFAULT 0,
+    ads_count INTEGER DEFAULT 0,
+    updated_at REAL DEFAULT 0
 );
 """
 
-_conn_closed = False
+# Агрегирующая статистика по каналам/постам/рекламе кэшируется в settings, чтобы
+# не делать тяжёлых COUNT на каждый запрос меню.
+STATS_CACHE_KEY = "stats_json_cache"
 
 
+# ------------------------------------------------------------- коннект к БД
 async def get_conn() -> aiosqlite.Connection:
     global _conn, _conn_closed
     if _conn is None or _conn_closed:
@@ -108,75 +131,12 @@ async def init_db() -> None:
     conn = await get_conn()
     async with _write_lock:
         await conn.executescript(SCHEMA)
-        await _migrate(conn)
-        await _fix_broken_memory(conn)
         await conn.commit()
     await _seed_ai_keys()
 
 
-async def _fix_broken_memory(conn) -> None:
-    """Если таблица memory из старой схемы (нет нужных колонок) — пересоздаём её.
-
-    Из-за старых таблиц без media_path/source_url/media_url сохранение падает.
-    Проще пересоздать таблицу памяти заново, чем мучить миграцию колонок.
-    """
-    try:
-        cur = await conn.execute("PRAGMA table_info(memory)")
-        rows = await cur.fetchall()
-        cols = {row[1] for row in rows}
-        required = {"media_path", "source_url", "media_url"}
-        if required.issubset(cols):
-            return
-        logger.warning("memory-таблица старой схемы (%s), пересоздаю…", sorted(cols))
-        await conn.execute("DROP TABLE IF EXISTS memory")
-        await conn.execute("""
-            CREATE TABLE memory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT NOT NULL,
-                source_url TEXT DEFAULT '',
-                topic TEXT DEFAULT '',
-                summary TEXT DEFAULT '',
-                keywords TEXT DEFAULT '',
-                importance INTEGER DEFAULT 5,
-                emotion TEXT DEFAULT 'neutral',
-                raw_text TEXT DEFAULT '',
-                media_path TEXT DEFAULT '',
-                media_url TEXT DEFAULT '',
-                created_at REAL DEFAULT 0
-            )
-        """)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Не удалось проверить/пересоздать memory: %s", e)
-
-
-async def _migrate(conn) -> None:
-    """Добавляет новые колонки к существующим таблицам."""
-    migrations = [
-        ("channels", "channel_description",
-         "ALTER TABLE channels ADD COLUMN channel_description TEXT DEFAULT ''"),
-        ("memory", "source_url",
-         "ALTER TABLE memory ADD COLUMN source_url TEXT DEFAULT ''"),
-        ("memory", "media_url",
-         "ALTER TABLE memory ADD COLUMN media_url TEXT DEFAULT ''"),
-        ("posts", "post_media_url",
-         "ALTER TABLE posts ADD COLUMN post_media_url TEXT DEFAULT ''"),
-    ]
-    for table, col, ddl in migrations:
-        try:
-            cur = await conn.execute(f"PRAGMA table_info({table})")
-            rows = await cur.fetchall()
-            cols = {row[1] for row in rows}
-            if col not in cols:
-                await conn.execute(ddl)
-        except Exception:
-            try:
-                await conn.execute(ddl)
-            except Exception as e:  # noqa: BLE001
-                if "duplicate column" not in str(e).lower():
-                    logger.warning("Миграция %s.%s не удалась: %s", table, col, e)
-
-
 async def _seed_ai_keys() -> None:
+    """Заносит ключи из .env в БД как источник истины для ротации."""
     conn = await get_conn()
     now = time.time()
     async with _write_lock:
@@ -256,21 +216,59 @@ async def remove_channel(channel_id: str) -> None:
     conn = await get_conn()
     async with _write_lock:
         await conn.execute("DELETE FROM channels WHERE channel_id=?", (channel_id,))
-        await conn.execute("DELETE FROM web_collect_state WHERE channel_id=?", (channel_id,))
+        await conn.execute("DELETE FROM source_channels WHERE channel_id=?", (channel_id,))
+        await conn.execute("DELETE FROM monitor_state WHERE channel_id=?", (channel_id,))
+        await conn.commit()
+
+
+# -------------------------------------------------------------------- sources
+async def add_source_channel(channel_id: str, source_id: str, source_title: str = "") -> bool:
+    conn = await get_conn()
+    async with _write_lock:
+        try:
+            await conn.execute(
+                "INSERT OR IGNORE INTO source_channels"
+                " (channel_id, source_channel_id, source_channel_title) VALUES (?, ?, ?)",
+                (channel_id, source_id, source_title),
+            )
+            await conn.commit()
+            return True
+        except Exception:
+            return False
+
+
+async def get_source_channels(channel_id: str | None = None) -> list[dict]:
+    conn = await get_conn()
+    sql = "SELECT * FROM source_channels"
+    args = ()
+    if channel_id:
+        sql += " WHERE channel_id=?"
+        args = (channel_id,)
+    cur = await conn.execute(sql, args)
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def remove_source_channel(channel_id: str, source_id: str) -> None:
+    conn = await get_conn()
+    async with _write_lock:
+        await conn.execute(
+            "DELETE FROM source_channels WHERE channel_id=? AND source_channel_id=?",
+            (channel_id, source_id),
+        )
         await conn.commit()
 
 
 # ---------------------------------------------------------------------- posts
-async def save_post(channel_id: str, text: str, media: str = "", media_url: str = "",
-                    scheduled: float = 0, ai_provider: str = "",
-                    ai_model: str = "") -> int:
+async def save_post(channel_id: str, text: str, media: str = "", source_id: str = "",
+                    source_post_id: int = 0, scheduled: float = 0,
+                    ai_provider: str = "", ai_model: str = "") -> int:
     conn = await get_conn()
     async with _write_lock:
         cur = await conn.execute(
-            "INSERT INTO posts (channel_id, post_text, post_media_path, post_media_url,"
-            " status, scheduled_time, ai_provider, ai_model, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (channel_id, text, media, media_url,
+            "INSERT INTO posts (channel_id, post_text, post_media_path, source_channel_id,"
+            " source_post_id, status, scheduled_time, ai_provider, ai_model, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (channel_id, text, media, source_id, source_post_id,
              "pending" if scheduled else "draft", scheduled, ai_provider, ai_model, time.time()),
         )
         await conn.commit()
@@ -443,6 +441,7 @@ async def ai_key_failed(provider: str, api_key: str, max_fails: int) -> None:
             "UPDATE ai_keys SET fail_count=fail_count+1, updated_at=? WHERE provider=? AND api_key=?",
             (time.time(), provider, api_key),
         )
+        # последовательные ошибки >= лимита — выключаем ключ автоматически
         await conn.execute(
             "UPDATE ai_keys SET enabled=0, updated_at=? WHERE provider=? AND api_key=? AND fail_count>=?",
             (time.time(), provider, api_key, max_fails),
@@ -451,17 +450,17 @@ async def ai_key_failed(provider: str, api_key: str, max_fails: int) -> None:
 
 
 # -------------------------------------------------------------------- память
-async def save_to_memory(channel_id: str, source_url: str, topic: str, summary: str,
+async def save_to_memory(channel_id: str, source_channel_id: str, topic: str, summary: str,
                          keywords: str, importance: int, emotion: str,
-                         raw_text: str, media_path: str = "", media_url: str = "") -> int:
+                         raw_text: str, source_post_id: int = 0) -> int:
     conn = await get_conn()
     async with _write_lock:
         cur = await conn.execute(
-            "INSERT INTO memory (channel_id, source_url, topic, summary, keywords,"
-            " importance, emotion, raw_text, media_path, media_url, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (channel_id, source_url, topic, summary, keywords,
-             importance, emotion, raw_text, media_path, media_url, time.time()),
+            "INSERT OR IGNORE INTO memory (channel_id, source_channel_id, topic, summary, keywords,"
+            " importance, emotion, raw_text, source_post_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (channel_id, source_channel_id, topic, summary, keywords,
+             importance, emotion, raw_text, source_post_id, time.time()),
         )
         await conn.commit()
         return cur.lastrowid
@@ -476,9 +475,8 @@ async def get_memory(channel_id: str, limit: int = 20) -> list[dict]:
     return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_recent_memory(channel_id: str, hours: int = 48, min_importance: int = 5,
-                            limit: int = 10) -> list[dict]:
-    since = time.time() - hours * 3600
+async def get_recent_memory(channel_id: str, hours: int = 48, min_importance: int = 1, limit: int = 10) -> list[dict]:
+    since = time.time() - max(hours, 1) * 3600
     conn = await get_conn()
     cur = await conn.execute(
         "SELECT * FROM memory WHERE channel_id=? AND created_at>? AND importance>=?"
@@ -510,10 +508,7 @@ async def clear_memory(channel_id: str, days: int = 30) -> None:
     cutoff = time.time() - days * 86400
     conn = await get_conn()
     async with _write_lock:
-        await conn.execute(
-            "DELETE FROM memory WHERE channel_id=? AND created_at<? AND importance<7",
-            (channel_id, cutoff),
-        )
+        await conn.execute("DELETE FROM memory WHERE channel_id=? AND created_at<? AND importance<7", (channel_id, cutoff))
         await conn.commit()
 
 
@@ -524,28 +519,31 @@ async def delete_memory_entry(entry_id: int) -> None:
         await conn.commit()
 
 
-# ------------------------------------------------------------ web collect state
-async def get_web_collect_state(channel_id: str) -> dict:
-    conn = await get_conn()
-    cur = await conn.execute("SELECT * FROM web_collect_state WHERE channel_id=?", (channel_id,))
-    row = await cur.fetchone()
-    if row:
-        return dict(row)
-    return {"channel_id": channel_id, "last_collect_time": 0}
-
-
-async def update_web_collect_state(channel_id: str) -> None:
+async def update_monitor_state(channel_id: str, last_post_id: int, source_channel_id: str = "") -> None:
+    key = f"{channel_id}|{source_channel_id}" if source_channel_id else channel_id
     conn = await get_conn()
     async with _write_lock:
         await conn.execute(
-            "INSERT OR REPLACE INTO web_collect_state (channel_id, last_collect_time) VALUES (?, ?)",
-            (channel_id, time.time()),
+            "INSERT OR REPLACE INTO monitor_state (channel_id, last_post_id, last_check_time)"
+            " VALUES (?, ?, ?)",
+            (key, last_post_id, time.time()),
         )
         await conn.commit()
 
 
+async def get_monitor_state(channel_id: str, source_channel_id: str = "") -> dict:
+    key = f"{channel_id}|{source_channel_id}" if source_channel_id else channel_id
+    conn = await get_conn()
+    cur = await conn.execute("SELECT * FROM monitor_state WHERE channel_id=?", (key,))
+    row = await cur.fetchone()
+    if row:
+        return dict(row)
+    return {"channel_id": key, "last_post_id": 0, "last_check_time": 0}
+
+
 # -------------------------------------------------------------------- статы
 async def get_stats() -> dict:
+    """Куда более лёгкий вариант: считаем только строки таблиц один раз."""
     stats = {"channels": 0, "posts_total": 0, "posts_published": 0, "posts_pending": 0,
              "posts_draft": 0, "ads_total": 0, "ads_published": 0, "ads_pending": 0,
              "memory_total": 0, "ai_keys": 0, "ai_keys_enabled": 0}

@@ -1,7 +1,14 @@
 """Telegram-интерфейс бота: меню, команды, диалоговые состояния."""
+import asyncio
 import logging
+import time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -14,15 +21,28 @@ import channel_parser as cp
 import database as db
 import monitor
 import scheduler
+import session_manager as sess
 from ai import providers
-from ai.analyzer import generate_from_memory
-from config import ADMIN_IDS, POSTS_PER_DAY, POST_HOURS, PROVIDERS
+from ai.analyzer import generate_from_memory, generate_from_text
+from config import (
+    ADMIN_IDS,
+    API_HASH,
+    API_ID,
+    PROVIDERS,
+    BOT_TOKEN,
+)
 
 logger = logging.getLogger(__name__)
 
+# user_states[user_id] = (action, extra) — свободные текстовые вводы
 user_states: dict[int, tuple] = {}
 
 BACK = "◀️ Назад"
+
+
+# ================================================================ helpers
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 def kb(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
@@ -31,10 +51,6 @@ def kb(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
 
 def back_btn(data: str = "menu_main") -> InlineKeyboardButton:
     return InlineKeyboardButton(BACK, callback_data=data)
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
 
 
 async def deny(update: Update) -> None:
@@ -47,13 +63,6 @@ def short(text: str, n: int = 40) -> str:
     return text[:n] + "…" if len(text) > n else text
 
 
-async def safe_answer(query) -> None:
-    try:
-        await query.answer()
-    except Exception:  # noqa: BLE001
-        pass
-
-
 # ================================================================ главное меню
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
@@ -64,13 +73,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def show_main(msg) -> None:
     keyboard = [
         [InlineKeyboardButton("📺 Каналы", callback_data="menu_channels")],
-        [InlineKeyboardButton("🧠 Память", callback_data="menu_memory")],
-        [InlineKeyboardButton("🧠 Сгенерировать контент (кнопка сбора)", callback_data="menu_collect")],
+        [InlineKeyboardButton("🧠 Память (мониторинг)", callback_data="menu_memory")],
         [InlineKeyboardButton("🤖 AI", callback_data="menu_ai")],
+        [InlineKeyboardButton("🔑 Аккаунт", callback_data="menu_account")],
         [InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")],
         [InlineKeyboardButton("📢 Рассылка", callback_data="broadcast")],
     ]
-    text = "🤖 *Auto-Poster*\nБот сам ведёт каналы по их описанию (ИИ генерит контент).\n\nИспользуй кнопки ниже."
+    text = "🤖 *TG Auto-Poster*\nУправление каналами через ИИ.\n\nИспользуй кнопки ниже."
     if callable(getattr(msg, "edit_message_text", None)):
         await msg.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
     else:
@@ -84,7 +93,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "*ℹ️ Управление — кнопками.*\n\n"
         "Для быстрого запуска: `/start`\n"
-        "Статус: `/status`",
+        "Состояние: `/status`\n"
+        "Вход в аккаунт: `/login`",
         parse_mode="Markdown",
     )
 
@@ -96,23 +106,30 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await send_status(update.message)
 
 
-async def send_status(msg) -> None:
+async def send_status(msg: Message) -> None:
+    me = await sess.me()
+    acc = f"✅ @{me['username']}" if me else "❌ не подключён"
+    sess_files = len(sess.list_session_files())
     keys = await db.list_ai_keys()
     total = len(keys)
     enabled = sum(1 for k in keys if k["enabled"])
     channels = await db.get_channels(active_only=False)
+    sources = await db.get_source_channels()
     stats = await db.get_stats()
-    schedule = f"{POSTS_PER_DAY} поста в {POST_HOURS}" if POSTS_PER_DAY and POST_HOURS else "интервалы"
+    pending_posts = stats["posts_pending"]
+    pending_ads = stats["ads_pending"]
 
     text = (
         f"*📊 Статус*\n\n"
+        f"🔑 Аккаунт: {acc}\n"
+        f"📁 .session файлов: {sess_files}\n"
         f"🤖 AI ключей: {enabled}/{total}\n"
         f"📺 Каналов: {len(channels)} (актив {stats['channels']})\n"
-        f"📝 Ожидают: посты {stats['posts_pending']}, реклама {stats['ads_pending']}\n"
+        f"📥 Источников: {len(sources)}\n"
+        f"📝 Ожидают: посты {pending_posts}, реклама {pending_ads}\n"
         f"🧠 Записей памяти: {stats['memory_total']}\n"
         f"⏱ Мониторинг: {'✅ вкл' if monitor.is_running() else '❌ выкл'}\n"
-        f"⏱ Автопостинг: {'✅ вкл' if scheduler.is_running() else '❌ выкл'}\n"
-        f"📅 Расписание: {schedule}"
+        f"⏱ Автопостинг: {'✅ вкл' if scheduler.is_running() else '❌ выкл'}"
     )
     await msg.reply_text(text, parse_mode="Markdown")
 
@@ -129,19 +146,7 @@ async def menu_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     keyboard.append([back_btn()])
     text = "*📺 Каналы*\n" + ("Нет каналов." if not channels else "")
     await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
-    await safe_answer(query)
-
-
-async def channel_add_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user_states[query.from_user.id] = ("add_channel", None)
-    await query.edit_message_text(
-        "✏️ Отправь @username ID канала или ссылку.\n"
-        "Важно: бот должен быть администратором этого канала.\n"
-        "После добавления обязательно опиши, о чём канал (кнопка «✏️ Описание») — "
-        "по этому описанию бот сам будет вести канал и генерить посты.",
-    )
-    await safe_answer(query)
+    await query.answer()
 
 
 async def channel_open(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
@@ -149,36 +154,43 @@ async def channel_open(update: Update, context: ContextTypes.DEFAULT_TYPE, chann
     ch = await db.get_channel(channel_id)
     if not ch:
         await query.edit_message_text("Канал не найден.", reply_markup=kb([[back_btn("menu_channels")]]))
-        await safe_answer(query)
+        await query.answer()
         return
+    sources = await db.get_source_channels(channel_id)
     status = "🟢 активен" if ch["is_active"] else "🔴 выключен"
-    desc = ch.get("channel_description") or "не задано"
     text = (
         f"*{ch.get('channel_title') or channel_id}*\n"
         f"ID: `{channel_id}`\n"
         f"Статус: {status}\n"
         f"Интервал: {ch.get('post_interval_min') or 60} мин\n"
-        f"📝 Описание: {short(desc, 80)}\n"
-        f"🎨 Стиль: {short(ch.get('style_prompt') or 'не задан', 60)}"
+        f"Источников: {len(sources)}\n"
+        f"Стиль: {short(ch.get('style_prompt') or 'не задан', 60)}"
     )
     keyboard = [
-        [InlineKeyboardButton("✏️ Описание канала (о чём он)", callback_data=f"ch_desc|{channel_id}")],
         [InlineKeyboardButton("🎨 Стиль", callback_data=f"ch_style|{channel_id}")],
         [InlineKeyboardButton("⏱ Интервал", callback_data=f"ch_interval|{channel_id}")],
         [InlineKeyboardButton("🟢/🔴 Вкл/Выкл", callback_data=f"ch_toggle|{channel_id}")],
-        [InlineKeyboardButton("🔄 Сгенерировать пост из памяти", callback_data=f"ch_gen|{channel_id}")],
-        [InlineKeyboardButton("🧪 Тест поста (не публикует)", callback_data=f"ch_test|{channel_id}")],
-        [InlineKeyboardButton("⚡ Выложить сейчас", callback_data=f"ch_now|{channel_id}")],
-        [InlineKeyboardButton("🚀 Тест-пост в канал", callback_data=f"ch_quick_test|{channel_id}")],
-        [InlineKeyboardButton("📥 Черновики", callback_data=f"ch_posts|{channel_id}")],
+        [InlineKeyboardButton("🔄 Сгенерировать", callback_data=f"ch_gen|{channel_id}")],
+        [InlineKeyboardButton("📥 Посты", callback_data=f"ch_posts|{channel_id}")],
+        [InlineKeyboardButton("📡 Источники", callback_data=f"ch_sources|{channel_id}")],
         [InlineKeyboardButton("🧠 Память", callback_data=f"mem_stats|{channel_id}")],
         [InlineKeyboardButton("📢 Реклама", callback_data=f"ch_ads|{channel_id}")],
-        [InlineKeyboardButton("🔍 Проверить канал", callback_data=f"ch_validate|{channel_id}")],
+        [InlineKeyboardButton("🔎 Анализ сейчас", callback_data=f"ch_analyze|{channel_id}")],
         [InlineKeyboardButton("❌ Удалить", callback_data=f"ch_del|{channel_id}")],
         [back_btn("menu_channels")],
     ]
     await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
-    await safe_answer(query)
+    await query.answer()
+
+
+async def channel_add_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_states[query.from_user.id] = ("add_channel", None)
+    await query.edit_message_text(
+        "✏️ Отправь @username, числовой ID или ссылку на канал.\n"
+        "_(требуется подключённый аккаунт)_",
+    )
+    await query.answer()
 
 
 async def channel_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
@@ -186,7 +198,7 @@ async def channel_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     await db.remove_channel(channel_id)
     user_states.pop(query.from_user.id, None)
     await query.edit_message_text("🗑 Канал удалён.", reply_markup=kb([[back_btn("menu_channels")]]))
-    await safe_answer(query)
+    await query.answer()
 
 
 async def channel_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
@@ -195,240 +207,64 @@ async def channel_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     if ch:
         await db.update_channel(channel_id, is_active=0 if ch["is_active"] else 1)
     await channel_open(update, context, channel_id)
-    await safe_answer(query)
-
-
-async def channel_description_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
-    query = update.callback_query
-    user_states[query.from_user.id] = ("set_desc", channel_id)
-    await query.edit_message_text(
-        "📝 Опиши, о чём этот канал — тематику, аудиторию, что нужно публиковать.\n"
-        "Например: «Канал про инвестиции в крипту для новичков, простым языком, "
-        "новости и обзоры, без хайпа».\n\n"
-        "По этому описанию ИИ будет сам генерить контент по описанию и вести канал.",
-    )
-    await safe_answer(query)
+    await query.answer()
 
 
 async def channel_style(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
     query = update.callback_query
     user_states[query.from_user.id] = ("set_style", channel_id)
     await query.edit_message_text(
-        "🎨 Опиши стиль постов (тон, эмодзи, оформление):",
+        "🎨 Опиши стиль постов для этого канала (тон, эмодзи, оформление):",
     )
-    await safe_answer(query)
+    await query.answer()
 
 
 async def channel_interval(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
     query = update.callback_query
     user_states[query.from_user.id] = ("set_interval", channel_id)
     await query.edit_message_text("⏱ Интервал автопостинга в минутах (минимум 5):")
-    await safe_answer(query)
+    await query.answer()
 
 
 async def channel_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
     query = update.callback_query
-    await query.edit_message_text("🔄 Генерирую пост из памяти…")
+    await query.edit_message_text("🔄 Генерирую пост из памяти/источников…")
     ch = await db.get_channel(channel_id)
     if not ch:
         await query.edit_message_text("Канал не найден.")
-        await safe_answer(query)
+        await query.answer()
         return
-    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=5, limit=8)
-    if not memory:
-        await query.edit_message_text(
-            "❌ В памяти нет данных. Сначала нажми «🧠 Сгенерировать контент» "
-            "или задай описание канала.",
-            reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
-        )
-        await safe_answer(query)
-        return
-    result = await generate_from_memory(memory, ch.get("style_prompt", ""))
-    if not result.get("text"):
-        await query.edit_message_text(f"❌ {result.get('error', 'Ошибка')}",
+    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=3, limit=10)
+    result = None
+    if memory:
+        result = await generate_from_memory(memory, ch.get("style_prompt", ""))
+    if not result or not result.get("text"):
+        sources = await db.get_source_channels(channel_id)
+        for src in sources:
+            posts = await cp.fetch_recent_posts(src["source_channel_id"], limit=1)
+            if not posts:
+                continue
+            result = await generate_from_text(posts[0]["text"], ch.get("style_prompt", ""),
+                                              ch.get("custom_instruction", ""))
+            break
+    if not result or not result.get("text"):
+        await query.edit_message_text(f"❌ {result.get('error', 'Нет источников/памяти')}",
                                       reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]))
-        await safe_answer(query)
+        await query.answer()
         return
-    media = memory[0].get("media_path") or ""
-    media_url = memory[0].get("media_url") or ""
-    post_id = await db.save_post(channel_id, result["text"], media, media_url,
+    post_id = await db.save_post(channel_id, result["text"],
                                  ai_provider=result["provider"], ai_model=result["model"])
     keyboard = [
         [InlineKeyboardButton("📤 Опубликовать", callback_data=f"post_pub|{post_id}")],
         [InlineKeyboardButton("🗑 Удалить", callback_data=f"post_del|{post_id}")],
         [back_btn(f"ch_open|{channel_id}")],
     ]
+    preview = result["text"][:1500]
     await query.edit_message_text(
-        f"🤖 *Пост* `{result['provider']}/{result['model']}`\n\n---\n{result['text'][:1500]}\n---",
+        f"🤖 *Пост* `{result['provider']}/{result['model']}`\n\n---\n{preview}\n---",
         reply_markup=kb(keyboard), parse_mode="Markdown",
     )
-    await safe_answer(query)
-
-
-async def channel_test(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
-    """Генерирует пост и показывает его в чате, НЕ публикуя."""
-    from ai.analyzer import generate_content_items
-    query = update.callback_query
-    ch = await db.get_channel(channel_id)
-    if not ch:
-        await query.edit_message_text("Канал не найден.", reply_markup=kb([[back_btn("menu_channels")]]))
-        await safe_answer(query)
-        return
-    await query.edit_message_text("🧪 Генерирую тестовый пост…")
-    try:
-        status_msg = await query.message.reply_text("🧠 AI думает…")
-    except Exception:  # noqa: BLE001
-        status_msg = None
-
-    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=5, limit=8)
-    if memory:
-        result = await generate_from_memory(memory, ch.get("style_prompt", ""))
-    else:
-        items = await generate_content_items(ch.get("channel_description", ""), ch.get("style_prompt", ""))
-        result = {"text": items[0]["content"] if items else "", "provider": "ai", "model": ""}
-
-    if not result.get("text"):
-        msg = "❌ Не удалось сгенерировать (задай описание канала или собери инфу)."
-        if status_msg is not None:
-            try:
-                await status_msg.edit_text(msg)
-            except Exception:  # noqa: BLE001
-                pass
-        await query.edit_message_text(msg, reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]))
-        await safe_answer(query)
-        return
-
-    text = f"🧪 *Тестовый пост* (не опубликован)\n\n---\n{result['text'][:1500]}\n---"
-    if status_msg is not None:
-        try:
-            await status_msg.edit_text(text, parse_mode="Markdown")
-        except Exception:  # noqa: BLE001
-            pass
-    await query.edit_message_text(text, reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
-                                  parse_mode="Markdown")
-    await safe_answer(query)
-
-
-async def channel_generate_now(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
-    query = update.callback_query
-    ch = await db.get_channel(channel_id)
-    if not ch:
-        await query.edit_message_text("Канал не найден.", reply_markup=kb([[back_btn("menu_channels")]]))
-        return
-    try:
-        await query.edit_message_text(f"⚡ Генерирую и публикую в «{ch.get('channel_title') or channel_id}»…")
-    except Exception:  # noqa: BLE001
-        pass
-    status_msg = await query.message.reply_text("🧠 AI думает над постом…")
-    ok = await scheduler.auto_post_for(ch)
-    try:
-        await status_msg.edit_text("✅ Пост сгенерирован и опубликован!" if ok else
-                                   "❌ Не удалось (нет памяти/черновиков или бот не админ канала).")
-    except Exception:  # noqa: BLE001
-        pass
-    await query.edit_message_text(
-        "✅ Готово." if ok else "❌ Не удалось опубликовать.",
-        reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
-    )
-    await safe_answer(query)
-
-
-async def channel_quick_test(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
-    """Мгновенно шлёт тестовый сообщение в канал (без AI, для проверки связи)."""
-    query = update.callback_query
-    ch = await db.get_channel(channel_id)
-    if not ch:
-        await query.edit_message_text("Канал не найден.", reply_markup=kb([[back_btn("menu_channels")]]))
-        await safe_answer(query)
-        return
-    title = ch.get("channel_title") or channel_id
-    try:
-        await query.edit_message_text(f"🚀 Отправляю тест-пост в «{title}»…")
-    except Exception:
-        pass
-    test_text = (
-        "🧪 *Тестовый пост*\n\n"
-        "Бот работает. Если вы видите это сообщение — всё ок.\n"
-        f"`{channel_id}`"
-    )
-    ok = await cp.send_post(channel_id, test_text)
-    if ok:
-        await query.edit_message_text(
-            f"✅ Тест-пост доставлен в «{title}»!",
-            reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
-        )
-    else:
-        await query.edit_message_text(
-            f"❌ Не удалось доставить в «{title}».\n\n"
-            "Проверь:\n"
-            "• Бот добавлен в канал как администратор?\n"
-            "• Права на публикацию постов включены?\n"
-            f"• Username/ID канала корректен: `{channel_id}`",
-            reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
-            parse_mode="Markdown",
-        )
-    await safe_answer(query)
-
-
-async def channel_validate(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
-    """Проверяет доступ бота к каналу и показывает результат."""
-    query = update.callback_query
-    ch = await db.get_channel(channel_id)
-    if not ch:
-        await query.edit_message_text("Канал не найден.", reply_markup=kb([[back_btn("menu_channels")]]))
-        await safe_answer(query)
-        return
-    try:
-        await query.edit_message_text("🔍 Проверяю канал…")
-    except Exception:
-        pass
-    valid, info = await cp.validate_channel(channel_id)
-    await query.edit_message_text(
-        f"*{ch.get('channel_title') or channel_id}*\nID: `{channel_id}`\n\n{info}",
-        reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
-        parse_mode="Markdown",
-    )
-    await safe_answer(query)
-
-
-async def channel_collect(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
-    query = update.callback_query
-    ch = await db.get_channel(channel_id)
-    if not ch:
-        await query.edit_message_text("Канал не найден.", reply_markup=kb([[back_btn("menu_channels")]]))
-        await safe_answer(query)
-        return
-    desc = (ch.get("channel_description") or "").strip()
-    if not desc:
-        await query.edit_message_text(
-            "❌ Сначала задай описание канала (кнопка «✏️ Описание канала»), "
-            "чтобы ИИ знал, что искать.",
-            reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
-        )
-        await safe_answer(query)
-        return
-    await query.edit_message_text("🧠 Генерирую контент по описанию канала… "
-                                  "(это может занять 1-2 минуты)")
-    status_msg = None
-    try:
-        status_msg = await query.message.reply_text("⏳ Идёт сбор и анализ контента…")
-    except Exception:  # noqa: BLE001
-        pass
-    stats = await monitor.manual_collect(ch)
-    await db.update_web_collect_state(channel_id)
-    text = (
-        f"🧠 Генерация завершена.\n"
-        f"Запросов сгенерировано: {stats.get('queries', 0)}\n"
-        f"Сохранено в память: {stats.get('saved', 0)}\n"
-        f"Ошибок: {stats.get('errors', 0)}"
-    )
-    if status_msg is not None:
-        try:
-            await status_msg.edit_text(text)
-        except Exception:  # noqa: BLE001
-            pass
-    await query.edit_message_text(text, reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]))
-    await safe_answer(query)
+    await query.answer()
 
 
 async def channel_posts(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
@@ -440,8 +276,8 @@ async def channel_posts(update: Update, context: ContextTypes.DEFAULT_TYPE, chan
         keyboard.append([InlineKeyboardButton(f"📤 {short(p['post_text'], 35)}",
                                               callback_data=f"post_pub|{p['id']}")])
     keyboard.append([back_btn(f"ch_open|{channel_id}")])
-    await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
-    await safe_answer(query)
+    await query.edit_message_text(text or "Черновиков нет.", reply_markup=kb(keyboard), parse_mode="Markdown")
+    await query.answer()
 
 
 async def post_publish(update: Update, context: ContextTypes.DEFAULT_TYPE, post_id: str) -> None:
@@ -452,9 +288,9 @@ async def post_publish(update: Update, context: ContextTypes.DEFAULT_TYPE, post_
     if ok:
         await query.edit_message_text("✅ Опубликовано.", reply_markup=kb([[back_btn(f"ch_open|{ch_id}")]]))
     else:
-        await query.edit_message_text("❌ Не удалось опубликовать (бот админ канала?).",
+        await query.edit_message_text("❌ Не удалось опубликовать (аккаунт подключён?).",
                                       reply_markup=kb([[back_btn(f"ch_open|{ch_id}")]]))
-    await safe_answer(query)
+    await query.answer()
 
 
 async def post_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, post_id: str) -> None:
@@ -463,7 +299,61 @@ async def post_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, post_i
     ch_id = post["channel_id"] if post else ""
     await db.delete_post(int(post_id))
     await query.edit_message_text("🗑 Пост удалён.", reply_markup=kb([[back_btn(f"ch_open|{ch_id}")]]))
-    await safe_answer(query)
+    await query.answer()
+
+
+async def channel_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
+    query = update.callback_query
+    ch = await db.get_channel(channel_id)
+    await query.edit_message_text("🔎 Анализирую последние посты источников…")
+    sources = await db.get_source_channels(channel_id)
+    state = await db.get_monitor_state(channel_id)
+    if ch:
+        stats = await monitor.analyze_channel(ch, sources, state)
+        await asyncio.sleep(0.2)
+        err = f"\n⚠️ {stats.get('error')}" if stats.get("error") else ""
+        await query.edit_message_text(
+            f"✅ Анализ завершён.\nНовых постов: {stats.get('new_posts', 0)}\n"
+            f"Сохранено в память: {stats.get('saved', 0)}{err}",
+            reply_markup=kb([[back_btn(f"ch_open|{channel_id}")]]),
+        )
+    else:
+        await query.edit_message_text("Канал не найден.")
+    await query.answer()
+
+
+# ================================================================ источники
+async def channel_sources(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
+    query = update.callback_query
+    sources = await db.get_source_channels(channel_id)
+    text = "*📡 Источники:*\n"
+    keyboard = []
+    for s in sources:
+        title = s.get("source_channel_title") or s["source_channel_id"]
+        keyboard.append([InlineKeyboardButton(f"❌ {title}",
+                                              callback_data=f"src_del|{channel_id}|{s['source_channel_id']}")])
+    keyboard.append([InlineKeyboardButton("➕ Добавить источник", callback_data=f"src_add|{channel_id}")])
+    keyboard.append([back_btn(f"ch_open|{channel_id}")])
+    if not sources:
+        text += "Нет источников."
+    else:
+        text += "\n".join(f"• {s.get('source_channel_title') or s['source_channel_id']}" for s in sources)
+    await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
+    await query.answer()
+
+
+async def source_add(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
+    query = update.callback_query
+    user_states[query.from_user.id] = ("add_source", channel_id)
+    await query.edit_message_text("✏️ Отправь @username или ссылку на канал-конкурент:")
+    await query.answer()
+
+
+async def source_del(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str, source_id: str) -> None:
+    query = update.callback_query
+    await db.remove_source_channel(channel_id, source_id)
+    await channel_sources(update, context, channel_id)
+    await query.answer()
 
 
 # ================================================================ реклама
@@ -479,14 +369,14 @@ async def channel_ads(update: Update, context: ContextTypes.DEFAULT_TYPE, channe
     keyboard.append([InlineKeyboardButton("➕ Добавить рекламу", callback_data=f"ad_add|{channel_id}")])
     keyboard.append([back_btn(f"ch_open|{channel_id}")])
     await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
-    await safe_answer(query)
+    await query.answer()
 
 
 async def ad_add(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
     query = update.callback_query
     user_states[query.from_user.id] = ("add_ad", channel_id)
     await query.edit_message_text("✏️ Отправь текст рекламного поста:")
-    await safe_answer(query)
+    await query.answer()
 
 
 async def ad_publish(update: Update, context: ContextTypes.DEFAULT_TYPE, ad_id: str) -> None:
@@ -494,66 +384,15 @@ async def ad_publish(update: Update, context: ContextTypes.DEFAULT_TYPE, ad_id: 
     row = await db.get_ad(int(ad_id))
     if not row:
         await query.edit_message_text("Реклама не найдена.")
-        await safe_answer(query)
+        await query.answer()
         return
     ok = await cp.send_post(row["channel_id"], row["ad_text"], row.get("ad_media_path") or None)
     if ok:
         await db.update_ad_status(row["id"], "published")
         await query.edit_message_text("✅ Реклама опубликована.")
     else:
-        await query.edit_message_text("❌ Не опубликована (бот админ канала?).")
-    await safe_answer(query)
-
-
-# ================================================================ сбор инфы
-async def menu_collect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    channels = await db.get_channels(active_only=False)
-    keyboard = []
-    for ch in channels:
-        title = ch.get("channel_title") or ch["channel_id"]
-        has_desc = "✅" if (ch.get("channel_description") or "").strip() else "❌"
-        keyboard.append([InlineKeyboardButton(f"🔎 {has_desc} {title}", callback_data=f"ch_collect|{ch['channel_id']}")])
-    keyboard.append([InlineKeyboardButton("🧠 Сгенерировать во всех каналах", callback_data="collect_all")])
-    keyboard.append([back_btn()])
-    await query.edit_message_text(
-        "🧠 *Генерация контента*\n\n"
-        "Бот по описанию каждого канала сам генерит контент и сохраняет в память.\n"
-        "✅ = описание задано, ❌ = нет описания.",
-        reply_markup=kb(keyboard), parse_mode="Markdown",
-    )
-    await safe_answer(query)
-
-
-async def collect_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.edit_message_text("🧠 Генерирую контент во всех каналах… (может занять несколько минут)")
-    try:
-        status_msg = await query.message.reply_text("⏳ Идёт сбор…")
-    except Exception:  # noqa: BLE001
-        status_msg = None
-    channels = await db.get_channels(active_only=True)
-    lines = []
-    for ch in channels:
-        desc = (ch.get("channel_description") or "").strip()
-        if not desc:
-            lines.append(f"— {ch.get('channel_title') or ch['channel_id']}: нет описания, пропущен")
-            continue
-        try:
-            stats = await monitor.manual_collect(ch)
-            await db.update_web_collect_state(ch["channel_id"])
-            lines.append(f"✅ {ch.get('channel_title') or ch['channel_id']}: +{stats.get('saved', 0)}")
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Сбор %s: %s", ch["channel_id"], e)
-            lines.append(f"❌ {ch.get('channel_title') or ch['channel_id']}: {e}")
-    text = "🧠 *Генерация завершена*\n\n" + "\n".join(lines)
-    if status_msg is not None:
-        try:
-            await status_msg.edit_text(text, parse_mode="Markdown")
-        except Exception:  # noqa: BLE001
-            pass
-    await query.edit_message_text(text, reply_markup=kb([[back_btn("menu_collect")]]), parse_mode="Markdown")
-    await safe_answer(query)
+        await query.edit_message_text("❌ Не опубликована (аккаунт подключён?).")
+    await query.answer()
 
 
 # ================================================================ память
@@ -566,15 +405,15 @@ async def menu_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         title = ch.get("channel_title") or ch["channel_id"]
         keyboard.append([InlineKeyboardButton(f"🧠 {title} ({count})", callback_data=f"mem_stats|{ch['channel_id']}")])
     keyboard.append([back_btn()])
-    await query.edit_message_text("🧠 *Память бота*\nКонтент, сгенерированный ИИ.",
+    await query.edit_message_text("🧠 *Память бота*\nAI накапливает важное из мониторинга.",
                                   reply_markup=kb(keyboard), parse_mode="Markdown")
-    await safe_answer(query)
+    await query.answer()
 
 
 async def mem_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
     query = update.callback_query
     ch = await db.get_channel(channel_id)
-    memory = await db.get_recent_memory(channel_id, hours=24 * 30, min_importance=1)
+    memory = await db.get_recent_memory(channel_id, hours=24, min_importance=1)
     total = len(memory)
     topics = {}
     for m in memory:
@@ -583,7 +422,7 @@ async def mem_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_
     title = ch.get("channel_title", channel_id) if ch else channel_id
     text = (
         f"*🧠 Память: {title}*\n"
-        f"Записей: {total}\n\n"
+        f"За 24ч: {total}\n\n"
         f"*Топ тем:*\n{topics_text}"
     )
     keyboard = [
@@ -594,7 +433,7 @@ async def mem_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_
         [back_btn(f"ch_open|{channel_id}")],
     ]
     await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
-    await safe_answer(query)
+    await query.answer()
 
 
 async def mem_list(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
@@ -608,26 +447,24 @@ async def mem_list(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_i
         text = "Пока нет записей."
     keyboard = [[back_btn(f"mem_stats|{channel_id}")]]
     await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
-    await safe_answer(query)
+    await query.answer()
 
 
 async def mem_search(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
     query = update.callback_query
     user_states[query.from_user.id] = ("memory_search", channel_id)
     await query.edit_message_text("🔍 Введи ключевое слово:")
-    await safe_answer(query)
+    await query.answer()
 
 
 async def mem_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
     query = update.callback_query
     ch = await db.get_channel(channel_id)
     await query.edit_message_text("🔄 Генерирую из памяти…")
-    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=5, limit=8)
+    memory = await db.get_recent_memory(channel_id, hours=48, min_importance=3, limit=10)
     result = await generate_from_memory(memory, (ch.get("style_prompt") if ch else ""))
     if result.get("text"):
-        media = memory[0].get("media_path", "") if memory else ""
-        media_url = memory[0].get("media_url", "") if memory else ""
-        post_id = await db.save_post(channel_id, result["text"], media, media_url,
+        post_id = await db.save_post(channel_id, result["text"],
                                      ai_provider=result["provider"], ai_model=result["model"])
         keyboard = [
             [InlineKeyboardButton("📤 Опубликовать", callback_data=f"post_pub|{post_id}")],
@@ -638,14 +475,14 @@ async def mem_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, chann
     else:
         await query.edit_message_text(f"❌ {result.get('error', 'Ошибка')}",
                                       reply_markup=kb([[back_btn(f"mem_stats|{channel_id}")]]))
-    await safe_answer(query)
+    await query.answer()
 
 
 async def mem_topic(update: Update, context: ContextTypes.DEFAULT_TYPE, channel_id: str) -> None:
     query = update.callback_query
     user_states[query.from_user.id] = ("memory_gen_topic", channel_id)
     await query.edit_message_text("📝 Введи тему для поста:")
-    await safe_answer(query)
+    await query.answer()
 
 
 # ================================================================ AI / ключи
@@ -674,7 +511,7 @@ async def menu_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [back_btn()],
     ]
     await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
-    await safe_answer(query)
+    await query.answer()
 
 
 async def ai_keys_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -694,7 +531,7 @@ async def ai_keys_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     keyboard.append([InlineKeyboardButton("➕ Добавить", callback_data="ai_add")])
     keyboard.append([back_btn("menu_ai")])
     await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
-    await safe_answer(query)
+    await query.answer()
 
 
 async def ai_add_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -703,17 +540,17 @@ async def ai_add_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.edit_message_text(
         "✏️ Формат: <code>провайдер ключ</code>\n"
         "Провайдеры: " + ", ".join(PROVIDERS) + "\n\n"
-        "Можно несколько ключей одного провайдера — будет ротация.",
+        "Можно несколько ключей одного провайдера — будет ротация и фолловер.",
         parse_mode="HTML",
     )
-    await safe_answer(query)
+    await query.answer()
 
 
 async def ai_del(update: Update, context: ContextTypes.DEFAULT_TYPE, key_id: str) -> None:
     query = update.callback_query
     await db.remove_ai_key(int(key_id))
     await ai_keys_menu(update, context)
-    await safe_answer(query)
+    await query.answer()
 
 
 async def ai_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, key_id: str) -> None:
@@ -722,7 +559,7 @@ async def ai_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, key_id: 
     if row:
         await db.set_ai_key_enabled(int(key_id), not row["enabled"])
     await ai_keys_menu(update, context)
-    await safe_answer(query)
+    await query.answer()
 
 
 async def ai_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -732,8 +569,9 @@ async def ai_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     usable = [k for k in keys if k["enabled"]]
     if not usable:
         await query.edit_message_text("Нет активных ключей.")
-        await safe_answer(query)
+        await query.answer()
         return
+    # тестируем по одному через движок
     ok = 0
     lines = []
     for k in usable:
@@ -743,7 +581,103 @@ async def ai_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ok += 1
     await query.edit_message_text(f"Результат: {ok}/{len(usable)}\n\n" + "\n".join(lines),
                                   reply_markup=kb([[back_btn("menu_ai")]]))
-    await safe_answer(query)
+    await query.answer()
+
+
+
+
+
+# ================================================================ аккаунт
+async def menu_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await sess.init_client()
+    me = await sess.me()
+    if me:
+        ph = sess.phone()
+        text = (f"*🔑 Аккаунт:*\n✅ @{me['username']} ({me['first_name']})\n"
+                f"id: {me['id']}")
+        if ph:
+            text += f"\n📱 {ph}"
+    else:
+        text = ("*🔑 Аккаунт:*\n❌ не подключён\n\n"
+                "📁 Просто сбрось `.session` файл прямо в этот чат — бот всё сам "
+                "подключит.\nЛибо нажми «Вход по телефону» и введи номер — придёт код.\n\n"
+                "💡 Если сессия ещё не активирована, бот всё равно войдёт по номеру + код.")
+
+    files = "\n".join(f"• {f}" for f in sess.list_session_files()) or "нет"
+    text += f"\n\n*Файлы сессий:*\n{files}"
+
+    keyboard = [
+        [InlineKeyboardButton("📁 Загрузить .session", callback_data="account_upload")],
+        [InlineKeyboardButton("👤 Вход по телефону", callback_data="account_login")],
+        [InlineKeyboardButton("📤 Экспорт session string", callback_data="account_export")],
+        [back_btn()],
+    ]
+    await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
+    await query.answer()
+
+
+async def account_upload_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_states[query.from_user.id] = ("upload_session", None)
+    await query.edit_message_text("📎 Отправь файл `.session` (Telethon session file).\n"
+                                  "Его можно получить на любом устройстве, где ты залогинен.",
+                                  parse_mode="Markdown")
+    await query.answer()
+
+
+async def account_login_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not API_ID or not API_HASH:
+        await query.edit_message_text("❌ API_ID/API_HASH не заданы в .env.",
+                                      reply_markup=kb([[back_btn("menu_account")]]))
+        await query.answer()
+        return
+    client = await sess.login_start()
+    if client is None:
+        await query.edit_message_text("❌ Не удалось инициализировать клиент.",
+                                      reply_markup=kb([[back_btn("menu_account")]]))
+        await query.answer()
+        return
+    user_states[query.from_user.id] = ("login_phone", None)
+    await query.edit_message_text("👤 Введи номер телефона в формате +79991234567:")
+    await query.answer()
+
+
+async def account_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    s = await sess.generate_string_session_export()
+    if s:
+        await query.edit_message_text("📤 Session string скопируй и сохрани в .env как SESSION_STRING",
+                                      reply_markup=kb([[back_btn("menu_account")]]))
+        try:
+            await query.message.reply_text(f"<code>{s}</code>", parse_mode="HTML")
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        await query.edit_message_text("❌ Аккаунт не подключён.", reply_markup=kb([[back_btn("menu_account")]]))
+    await query.answer()
+
+
+async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return await deny(update)
+    if not API_ID or not API_HASH:
+        await update.message.reply_text("❌ API_ID/API_HASH не заданы в .env.")
+        return
+    client = await sess.login_start()
+    if client is None:
+        await update.message.reply_text("❌ Не удалось инициализировать клиент.")
+        return
+    user_states[update.effective_user.id] = ("login_phone", None)
+    await update.message.reply_text("👤 Введи номер телефона в формате +79991234567:")
+
+
+async def cmd_upload_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return await deny(update)
+    user_states[update.effective_user.id] = ("upload_session", None)
+    await update.message.reply_text("📎 Отправь файл `.session`", parse_mode="Markdown")
 
 
 # ================================================================ статистика
@@ -761,7 +695,7 @@ async def menu_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     keyboard = [[back_btn()]]
     await query.edit_message_text(text, reply_markup=kb(keyboard), parse_mode="Markdown")
-    await safe_answer(query)
+    await query.answer()
 
 
 # ================================================================ рассылка
@@ -781,11 +715,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     state = user_states.get(user_id)
 
     if not state:
+        # вне диалога — короткое меню
         await show_main(update.message)
         return
 
     action, extra = state
 
+    # --- AI ключи
     if action == "add_key":
         parts = text.split(maxsplit=2)
         if len(parts) < 2 or parts[0].lower() not in PROVIDERS:
@@ -799,33 +735,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         user_states.pop(user_id, None)
         return
 
+    # --- каналы
     if action == "add_channel":
-        cid, title = normalize_channel_input(text)
-        if not cid:
-            await update.message.reply_text(
-                "❌ Не удалось разобрать. Введи числовой ID канала или @username "
-                "(без полной ссылки). Бот должен быть админом канала.")
+        resolved = await cp.resolve_channel(text)
+        if not resolved:
+            await update.message.reply_text("❌ Канал не найден. Проверь @username/sсылку/ID")
+            user_states.pop(user_id, None)
             return
-        ok = await db.add_channel(cid, title, "", interval=60)
-        if ok:
-            valid, info = await cp.validate_channel(cid)
-            await update.message.reply_text(
-                f"✅ Канал *{title or cid}* добавлен!\n\n{info}\n\n"
-                "📝 Теперь открой канал и задай описание (о чём он) — по нему бот "
-                "будет сам вести канал.",
-                parse_mode="Markdown",
-            )
-        else:
-            await update.message.reply_text("❌ Уже есть в базе.")
+        ok = await db.add_channel(resolved["id"], resolved["title"], resolved["username"],
+                                  interval=60)
+        await update.message.reply_text(
+            f"✅ Канал *{resolved['title']}* добавлен!" if ok else "❌ Уже есть в базе.",
+            parse_mode="Markdown",
+        )
         user_states.pop(user_id, None)
         return
 
-    if action == "set_desc" and extra:
-        await db.update_channel(extra, channel_description=text)
-        await update.message.reply_text(
-            "✅ Описание сохранено.\n\n"
-            "Теперь можно нажать «🧠 Сгенерировать контент» — ИИ найдёт контент "
-            "по описанию и сохранит в память, а автопостинг будет вести канал.")
+    if action == "add_source" and extra:
+        resolved = await cp.resolve_channel(text)
+        if not resolved:
+            await update.message.reply_text("❌ Источник не найден.")
+            user_states.pop(user_id, None)
+            return
+        await db.add_source_channel(extra, resolved["id"], resolved["title"])
+        await update.message.reply_text(f"✅ Источник *{resolved['title']}* добавлен.", parse_mode="Markdown")
         user_states.pop(user_id, None)
         return
 
@@ -859,7 +792,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("❌ Пустой текст.")
             user_states.pop(user_id, None)
             return
-        import asyncio
         for ch in channels:
             if await cp.send_post(ch["channel_id"], text):
                 ok += 1
@@ -884,13 +816,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "memory_gen_topic" and extra:
         await update.message.reply_text("🔄 Генерирую…")
         ch = await db.get_channel(extra)
-        memory = await db.get_recent_memory(extra, hours=48, min_importance=5, limit=8)
+        memory = await db.get_recent_memory(extra, hours=48, min_importance=3, limit=10)
         result = await generate_from_memory(memory, (ch.get("style_prompt") if ch else ""), target_topic=text)
         if result.get("text"):
-            media = memory[0].get("media_path", "") if memory else ""
-            media_url = memory[0].get("media_url", "") if memory else ""
-            post_id = await db.save_post(extra, result["text"], media, media_url,
+            post_id = await db.save_post(extra, result["text"],
                                          ai_provider=result["provider"], ai_model=result["model"])
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             k = InlineKeyboardMarkup([[InlineKeyboardButton("📤 Опубликовать", callback_data=f"post_pub|{post_id}")]])
             await update.message.reply_text(result["text"][:3900], reply_markup=k)
         else:
@@ -898,19 +829,71 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         user_states.pop(user_id, None)
         return
 
+    if not is_admin(user_id):
+        return
 
-def normalize_channel_input(text: str) -> tuple[str, str]:
-    """Возвращает (channel_id, title) с учётом @username и числового ID."""
-    ref = (text or "").strip()
-    if ref.startswith("https://t.me/"):
-        ref = ref[len("https://t.me/"):].split("/")[0].split("?")[0]
-    elif ref.startswith("t.me/"):
-        ref = ref[len("t.me/"):].split("/")[0].split("?")[0]
-    if ref.startswith("@"):
-        return ref[1:], ""
-    if ref.lstrip("-").isdigit():
-        return ref, ""
-    return ref, ""
+    # --- логин в аккаунт
+    if action == "login_phone":
+        if not text.startswith("+"):
+            await update.message.reply_text("❌ Формат: +79991234567")
+            return
+        try:
+            await sess.send_code(sess.raw_client(), text)
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}")
+            return
+        user_states[user_id] = ("login_code", text)
+        await update.message.reply_text("📨 Код отправлен. Введи код из Telegram:")
+        return
+
+    if action == "login_code":
+        phone = extra
+        try:
+            res = await sess.login_code(sess.raw_client(), phone, text)
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e} (введи код ещё раз)")
+            return
+        if res["status"] == "password":
+            user_states[user_id] = ("login_password", None)
+            await update.message.reply_text("🔐 Нужен пароль 2FA. Введи пароль:")
+        else:
+            user_states.pop(user_id, None)
+            await update.message.reply_text("✅ Аккаунт подключён! /status для деталей")
+        return
+
+    if action == "login_password":
+        try:
+            await sess.login_password(sess.raw_client(), text)
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}")
+            return
+        user_states.pop(user_id, None)
+        await update.message.reply_text("✅ Аккаунт подключён! /status для деталей")
+        return
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    doc = update.message.document
+    if not doc or not doc.file_name or not doc.file_name.lower().endswith(".session"):
+        return
+    file = await doc.get_file()
+    data = await file.download_as_bytearray()
+    ok = await sess.save_uploaded_session(bytes(data), doc.file_name)
+    if ok:
+        me = await sess.me()
+        ph = sess.phone()
+        who = f"@{me['username']} {ph or ''}" if me else ""
+        await update.message.reply_text(f"✅ Сессия подключена! Аккаунт: {who}")
+        user_states.pop(user_id, None)
+    else:
+        user_states[user_id] = ("login_phone", None)
+        await update.message.reply_text(
+            "📁 Сессия сохранена, но не активирована.\n"
+            "👉 Введи номер телефона формате +79991234567 — бот получит код "
+            "и завершит вход прямо здесь.")
 
 
 # ================================================================ маршрутизация callback
@@ -919,24 +902,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not is_admin(q.from_user.id):
         await q.answer("Нет доступа", show_alert=True)
         return
-    try:
-        await q.answer()
-    except Exception:  # noqa: BLE001
-        pass
     data = q.data
 
+    # простая таблица маршрутов
     if data == "menu_main":
         await show_main(q)
     elif data == "menu_channels":
         await menu_channels(update, context)
     elif data == "menu_memory":
         await menu_memory(update, context)
-    elif data == "menu_collect":
-        await menu_collect(update, context)
-    elif data == "collect_all":
-        await collect_all(update, context)
     elif data == "menu_ai":
         await menu_ai(update, context)
+    elif data == "menu_account":
+        await menu_account(update, context)
     elif data == "menu_stats":
         await menu_stats(update, context)
     elif data == "broadcast":
@@ -949,34 +927,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await ai_add_prompt(update, context)
     elif data == "ai_test":
         await ai_test(update, context)
+    elif data == "account_upload":
+        await account_upload_prompt(update, context)
+    elif data == "account_login":
+        await account_login_prompt(update, context)
+    elif data == "account_export":
+        await account_export(update, context)
     elif data.startswith("ch_open|"):
         await channel_open(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_del|"):
         await channel_delete(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_toggle|"):
         await channel_toggle(update, context, data.split("|", 1)[1])
-    elif data.startswith("ch_desc|"):
-        await channel_description_prompt(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_style|"):
         await channel_style(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_interval|"):
         await channel_interval(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_gen|"):
         await channel_generate(update, context, data.split("|", 1)[1])
-    elif data.startswith("ch_test|"):
-        await channel_test(update, context, data.split("|", 1)[1])
-    elif data.startswith("ch_now|"):
-        await channel_generate_now(update, context, data.split("|", 1)[1])
-    elif data.startswith("ch_quick_test|"):
-        await channel_quick_test(update, context, data.split("|", 1)[1])
-    elif data.startswith("ch_validate|"):
-        await channel_validate(update, context, data.split("|", 1)[1])
-    elif data.startswith("ch_collect|"):
-        await channel_collect(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_posts|"):
         await channel_posts(update, context, data.split("|", 1)[1])
+    elif data.startswith("ch_sources|"):
+        await channel_sources(update, context, data.split("|", 1)[1])
     elif data.startswith("ch_ads|"):
         await channel_ads(update, context, data.split("|", 1)[1])
+    elif data.startswith("ch_analyze|"):
+        await channel_analyze(update, context, data.split("|", 1)[1])
+    elif data.startswith("src_add|"):
+        await source_add(update, context, data.split("|", 1)[1])
+    elif data.startswith("src_del|"):
+        _, ch, src = data.split("|")
+        await source_del(update, context, ch, src)
     elif data.startswith("post_pub|"):
         await post_publish(update, context, data.split("|", 1)[1])
     elif data.startswith("post_del|"):
@@ -999,11 +980,36 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await ai_toggle(update, context, data.split("|", 1)[1])
     elif data.startswith("ai_del|"):
         await ai_del(update, context, data.split("|", 1)[1])
+    else:
+        await q.answer()
 
 
 def register(app) -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("login", cmd_login))
+    app.add_handler(CommandHandler("upload_session", cmd_upload_session))
+    app.add_handler(CommandHandler("analyze", cmd_analyze))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+
+async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return await deny(update)
+    channels = await db.get_channels(active_only=True)
+    report = []
+    for ch in channels:
+        sources = await db.get_source_channels(ch["channel_id"])
+        if not sources:
+            continue
+        state = await db.get_monitor_state(ch["channel_id"])
+        stats = await monitor.analyze_channel(ch, sources, state)
+        title = ch.get("channel_title") or ch["channel_id"]
+        report.append(f"• {title}: новых {stats.get('new_posts', 0)}, в память {stats.get('saved', 0)}")
+    if not report:
+        await update.message.reply_text("Нет активных каналов с источниками.")
+        return
+    await update.message.reply_text("🔎 *Анализ завершён*\n\n" + "\n".join(report), parse_mode="Markdown")
